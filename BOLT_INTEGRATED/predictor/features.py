@@ -320,8 +320,8 @@ def add_future_weather_features(
             irrad_h = extended_irrad_w_m2.shift(-h).iloc[:n].reset_index(drop=True)
             temp_h  = extended_temp_c.shift(-h).iloc[:n].reset_index(drop=True)
             # Forward-fill the very last edge if any NaN slipped in
-            irrad_h = irrad_h.fillna(method="ffill").fillna(0.0)
-            temp_h  = temp_h.fillna(method="ffill").fillna(_synth_temp_at_offset(h))
+            irrad_h = irrad_h.ffill().fillna(0.0)
+            temp_h  = temp_h.ffill().fillna(_synth_temp_at_offset(h))
             out[f"fut_irrad_h{h}"] = irrad_h.values
             out[f"fut_temp_h{h}"]  = temp_h.values
         else:
@@ -337,10 +337,10 @@ def add_future_weather_features(
             ahead_mean  = extended_irrad_w_m2.rolling(w, min_periods=1).mean().shift(-w)
             ahead_tmax  = extended_temp_c.rolling(w, min_periods=1).max().shift(-w)
             out[f"fut_irrad_{w*30}min_mean"] = (
-                ahead_mean.iloc[:n].fillna(method="ffill").fillna(0.0).values
+                ahead_mean.iloc[:n].ffill().fillna(0.0).values
             )
             out[f"fut_temp_{w*30}min_max"] = (
-                ahead_tmax.iloc[:n].fillna(method="ffill")
+                ahead_tmax.iloc[:n].ffill()
                           .fillna(_synth_temp_at_offset(w)).values
             )
         else:

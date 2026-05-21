@@ -19,6 +19,10 @@ from predictor.data_loader import auto_load, load_csv, summarize
 from predictor.solar_estimator import detect_has_solar, estimate_solar_capacity_kwp
 from predictor.forecaster import DirectMultiStepForecaster
 from predictor.cv import expanding_window_cv, format_cv_report
+from predictor.simulation import (
+    initialize_simulation, advance_one_tick, compute_running_accuracy,
+    build_forecast_vs_actual_df, split_historical_for_simulation,
+)
 
 from manager.optimizer import run_ai_manager, parse_uploaded_data, calc_kva
 
@@ -49,7 +53,12 @@ from site_profiles import (
     DEFAULT_PROFILE_ID,
 )
 
-from persistence import load_overrides, save_overrides, OVERRIDES_PATH
+from persistence import (
+    load_overrides, save_overrides, OVERRIDES_PATH,
+    save_load_profile, load_load_profile,
+    save_forecaster,   load_forecaster,
+    site_state_info,   all_sites_state_info, clear_site_state,
+)
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -77,6 +86,17 @@ for key, default in [
     ("tariff_schedule_key", "new_2025"),  # 'new_2025' or 'legacy_2014'
     ("site_profile_id", DEFAULT_PROFILE_ID),
     ("sizing_sweep", None),
+    # Live simulation state — owned by the Live Simulation tab.  Lazy-inited
+    # when the user opens the tab with a trained forecaster + data present.
+    ("sim_state", None),
+    ("sim_playing", False),       # autoplay flag
+    ("sim_history_actuals", None),  # cached "what was already in the forecaster's
+                                     # history" so we can plot revealed-vs-historical
+    # Forward-looking Manager output, re-computed every sim tick.  Read by
+    # the AI Manager tab's live fragment.  Distinct from manager_results
+    # (which is the user's manual-mode run on historical data).
+    ("live_manager_results", None),
+    ("live_manager_last_tick", -1),
     # Per-site override dict: {site_id: {field: user_value}}.  Any field not
     # in here falls back to the site profile preset.  Editing in the Site
     # Setup tab populates these; switching site profile in the sidebar
@@ -131,6 +151,69 @@ def _set_so(field: str, value):
     """Set an override for the active site."""
     ov = _site_overrides_for(st.session_state.site_profile_id)
     ov[field] = value
+
+
+def _run_manager_on_live_forecast() -> list | None:
+    """Run the AI Manager on the *current 24-h forecast* to produce a
+    forward-looking dispatch plan that updates every sim tick.
+
+    Returns None when prerequisites are missing (sim not initialised,
+    forecaster not trained, battery_kwh=0, etc.).  Errors are swallowed —
+    a stale live_manager_results is preferable to crashing the fragment.
+    """
+    sim = st.session_state.get("sim_state")
+    fc  = st.session_state.get("forecaster")
+    if sim is None or fc is None or getattr(sim, "current_forecast", None) is None:
+        return None
+
+    profile = get_profile(st.session_state.site_profile_id)
+    battery_kwh = float(_so("battery_kwh", profile.battery_kwh) or profile.battery_kwh)
+    if battery_kwh <= 0:
+        battery_kwh = max(profile.battery_kwh, 100.0)
+
+    try:
+        mgr_df = forecast_to_manager_df(sim.current_forecast, historical_df=fc.history)
+    except Exception:
+        return None
+    if mgr_df is None or mgr_df.empty:
+        return None
+
+    # Build loads dict from profile, then layer Site Setup overrides on top
+    loads = profile_loads_for_manager(profile)
+    ov = _site_overrides_for(profile.id)
+    if "ev" in loads:
+        ev = loads["ev"]
+        if any(k in ov for k in ("ev_count", "ev_kw_each", "ev_kind")):
+            c   = int(ov.get("ev_count",   4))
+            kwe = float(ov.get("ev_kw_each", 22.0))
+            kd  = str(ov.get("ev_kind",    "AC"))
+            ev["ev_chargers"] = [{"count": c, "kw_each": kwe, "kind": kd}]
+            ev["ev_total_kw"] = c * kwe
+        if any(k in ov for k in ("ev_window_start", "ev_window_end")):
+            ev["allowed_window"] = [int(ov.get("ev_window_start", 18)),
+                                     int(ov.get("ev_window_end",   8))]
+    if "hvac" in loads:
+        hv = loads["hvac"]
+        if any(k in ov for k in ("hvac_protect_start", "hvac_protect_end")):
+            hv["protected_window"] = [int(ov.get("hvac_protect_start", 9)),
+                                       int(ov.get("hvac_protect_end",  17))]
+        if "hvac_max_cut_pct" in ov:
+            hv["max_cut_pct"] = float(ov["hvac_max_cut_pct"]) / 100.0
+
+    try:
+        return run_ai_manager(
+            mgr_df, loads,
+            battery_capacity_kwh=battery_kwh,
+            priority_order=list(loads.keys()),
+            peak_target_pct=float(_so("md_target_pct",      profile.md_target_pct)),
+            bat_charge_upper_pct=float(_so("charge_upper_pct", profile.charge_upper_pct)),
+            c_rate=float(_so("c_rate", profile.c_rate)),
+            initial_soc_pct=float(_so("init_soc_pct", profile.initial_soc_pct)),
+            bat_efficiency=0.95,
+            peak_reference_kva=None,
+        )
+    except Exception:
+        return None
 
 
 def _invalidate_downstream():
@@ -261,6 +344,82 @@ def _run_manager_on_df(df: pd.DataFrame, loads: dict, priority_order: list,
     )
 
 
+def _bootstrap_active_site():
+    """Hydrate session_state from disk for the active site.
+
+    Triggered:
+      • First page render of a new session (no `_loaded_site_id` yet)
+      • Sidebar profile dropdown changes (mismatch with `_loaded_site_id`)
+
+    Side-effects:
+      • Clears stale Manager / Bill / ROI state when switching sites.
+      • Loads saved load profile → `st.session_state.df` + summary + tariff
+      • Loads saved forecaster → `st.session_state.forecaster` + initial forecast
+
+    Idempotent: when `_loaded_site_id` already matches, this no-ops cheaply
+    (the function returns after the first guard), so Streamlit's frequent
+    page re-renders don't keep re-reading disk.
+    """
+    site_id = st.session_state.site_profile_id
+    if st.session_state.get("_loaded_site_id") == site_id:
+        return
+
+    # Switching sites — clear stale per-site pipeline state first
+    for key in ("df", "file_summary", "solar_info", "forecaster", "forecast_result",
+                "manager_results", "manager_df_optimized", "manager_df_original",
+                "powerreco_df", "solar_sizing", "battery_sizing", "roi", "sizing_sweep"):
+        st.session_state[key] = None
+
+    loaded_bits: list[str] = []
+
+    # 1) Load saved load profile
+    saved_df = load_load_profile(site_id)
+    if saved_df is not None and len(saved_df) > 0:
+        st.session_state.df = saved_df
+        try:
+            summ = summarize(saved_df)
+            summ["max_kw_import"] = float(saved_df["kw_import"].max())
+            st.session_state.file_summary = summ
+        except Exception:
+            pass
+        try:
+            has_solar, reason = detect_has_solar(saved_df)
+            solar_info = {"has_solar": has_solar, "reason": reason}
+            if has_solar:
+                solar_info.update(estimate_solar_capacity_kwp(saved_df))
+            st.session_state.solar_info = solar_info
+        except Exception:
+            pass
+        try:
+            tc, _, _ = auto_detect_tariff(saved_df)
+            st.session_state.tariff_code = tc
+        except Exception:
+            pass
+        loaded_bits.append(f"load profile ({len(saved_df):,} rows)")
+
+    # 2) Load saved trained forecaster
+    saved_fc = load_forecaster(site_id)
+    if saved_fc is not None:
+        st.session_state.forecaster = saved_fc
+        try:
+            st.session_state.forecast_result = saved_fc.forecast(output_steps=48)
+            loaded_bits.append("trained forecaster")
+        except Exception:
+            # Saved model exists but predict() failed (likely feature mismatch).
+            # Drop it so the UI prompts a fresh train.
+            st.session_state.forecaster = None
+            st.session_state.forecast_result = None
+
+    st.session_state._loaded_site_id = site_id
+    st.session_state._bootstrap_msg = (
+        f"✅ Restored {' + '.join(loaded_bits)} for "
+        f"{get_profile(site_id).name}." if loaded_bits else None
+    )
+
+
+_bootstrap_active_site()
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SIDEBAR
 # ══════════════════════════════════════════════════════════════════════════════
@@ -354,10 +513,17 @@ with st.sidebar:
 # ══════════════════════════════════════════════════════════════════════════════
 # TABS
 # ══════════════════════════════════════════════════════════════════════════════
-tab0, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+# Show one-time bootstrap message at the top (cleared once shown)
+_boot_msg = st.session_state.pop("_bootstrap_msg", None)
+if _boot_msg:
+    st.success(_boot_msg + "  Open the Predictor tab to forecast, or edit "
+                            "parameters in Site Setup → Apply & Re-run.")
+
+tab0, tab1, tab2, tab_live, tab3, tab4, tab5 = st.tabs([
     "🛠️ Site Setup",
     "📂 Data Upload",
     "📈 Predictor",
+    "🔴 Live Simulation",
     "⚙️ AI Manager",
     "💰 Bill Calculator",
     "🌞 PowerRECO",
@@ -377,11 +543,63 @@ with tab0:
         f"**Apply & Re-run** to invalidate cached results and update the strategy."
     )
 
+    # ── Persisted state overview ───────────────────────────────────────────
+    st.markdown("##### 💾 Persisted state across all sites")
+    st.caption(
+        "Uploaded load profiles and trained forecasters are saved per site to "
+        "`data/sites/<id>/`.  They auto-load when you re-open the app — no "
+        "re-upload or re-train needed.  Site Setup overrides save to "
+        f"`{OVERRIDES_PATH.name}`."
+    )
+    _all_state = all_sites_state_info(list(PROFILES.keys()))
+    _state_rows = []
+    for s in _all_state:
+        _pname = PROFILES[s["site_id"]].name
+        _state_rows.append({
+            "Site": _pname,
+            "Data":       (f"✅ {s['data_rows']:,} rows · {s['data_kb']} KB · {s['data_saved']}"
+                            if s["has_data"] else "—"),
+            "Forecaster": (f"✅ {s['model_mb']} MB · {s['model_saved']}"
+                            if s["has_model"] else "—"),
+        })
+    st.dataframe(pd.DataFrame(_state_rows), use_container_width=True, hide_index=True)
+
+    _cur_state = site_state_info(_active.id)
+    cs1, cs2 = st.columns([3, 1])
+    if _cur_state["has_data"] or _cur_state["has_model"]:
+        with cs1:
+            st.caption(
+                f"For **{_active.name}**: "
+                + ("data ✅ · "    if _cur_state["has_data"]  else "data ❌ · ")
+                + ("model ✅"      if _cur_state["has_model"] else "model ❌")
+            )
+        with cs2:
+            if st.button("🗑️ Clear saved data + model", use_container_width=True,
+                          help="Removes the per-site disk files for the active site. "
+                               "Overrides (the Site Setup edits below) are kept."):
+                clear_site_state(_active.id, also_clear_overrides=False)
+                # Drop session_state mirror so a refresh re-bootstraps cleanly
+                st.session_state._loaded_site_id = None
+                st.session_state.df = None
+                st.session_state.forecaster = None
+                st.success(f"Cleared disk state for **{_active.name}**.")
+                st.rerun()
+    else:
+        st.caption(f"No saved state yet for **{_active.name}** — upload a load "
+                    f"profile in the Data Upload tab and the system will start "
+                    f"remembering it.")
+
+    st.divider()
+
+    # Use a per-site key suffix so switching profiles re-mounts widgets with
+    # fresh defaults (without this, Streamlit holds the OLD site's values).
+    _wk = f"ss_{_active.id}_"
     with st.expander("📍 Location (drives weather + irradiance lookup)", expanded=True):
         l1, l2, l3 = st.columns(3)
         new_lat = l1.number_input(
             "Latitude",  -90.0, 90.0,
             float(_so("lat", _active.lat)), step=0.001, format="%.4f",
+            key=_wk + "lat",
             help="Used to pull real ambient temperature + shortwave irradiance "
                  "from Open-Meteo for both training and live forecasts. "
                  "Defaults to Kuala Lumpur.",
@@ -389,15 +607,18 @@ with tab0:
         new_lon = l2.number_input(
             "Longitude", -180.0, 180.0,
             float(_so("lon", _active.lon)), step=0.001, format="%.4f",
+            key=_wk + "lon",
         )
         new_tz  = l3.text_input(
             "Timezone", _so("timezone", _active.timezone),
+            key=_wk + "tz",
             help="Either an IANA name (e.g. 'Asia/Kuala_Lumpur') or 'auto' "
                  "to infer from lat/lon.",
         )
         new_use_weather = st.checkbox(
             "Use real weather data (Open-Meteo)",
             value=bool(st.session_state.use_real_weather),
+            key=_wk + "real_weather",
             help="When on, the forecaster pulls actual temperature + irradiance "
                  "from Open-Meteo's archive (past) and forecast (future) endpoints. "
                  "Falls back to a synthetic tropical model on network failure. "
@@ -411,7 +632,7 @@ with tab0:
             value=float(_so("solar_kwp",
                             _active.expected_solar_kwp if _active.expected_solar_kwp is not None
                             else 0.0)),
-            step=10.0,
+            step=10.0, key=_wk + "solar_kwp",
             help="0 if no solar installed yet. Used by the forecaster (for "
                  "net-load shape) and by PowerRECO (as the starting point "
                  "for sizing recommendations).",
@@ -419,21 +640,22 @@ with tab0:
         new_roof_area = s2.number_input(
             "Roof area (m²)", 50.0, 10000.0,
             float(_so("roof_area_m2", _active.expected_roof_area_m2)),
-            step=50.0,
+            step=50.0, key=_wk + "roof_area",
             help="Caps the maximum solar PV size PowerRECO will recommend.",
         )
         new_panel_w = s3.number_input(
             "Panel wattage (W)", 300, 700,
-            int(_so("panel_w", 415)), step=5,
+            int(_so("panel_w", 415)), step=5, key=_wk + "panel_w",
         )
         s4, s5 = st.columns(2)
         new_psh = s4.number_input(
             "Peak sun hours/day", 3.5, 6.0, float(_so("psh", 4.5)), step=0.1,
+            key=_wk + "psh",
             help="Malaysia average ~4.5 h/day. Override with site-specific PVGIS value if known.",
         )
         new_solar_cost = s5.number_input(
             "Solar cost (RM/kWp)", 2000.0, 6000.0,
-            float(_so("solar_cost", 3500.0)), step=100.0,
+            float(_so("solar_cost", 3500.0)), step=100.0, key=_wk + "solar_cost",
         )
 
     with st.expander("🔋 Battery & dispatch", expanded=False):
@@ -441,28 +663,33 @@ with tab0:
         new_battery_kwh = b1.number_input(
             "Battery capacity (kWh)", 0.0, 5000.0,
             float(_so("battery_kwh", _active.battery_kwh)), step=10.0,
+            key=_wk + "battery_kwh",
             help="0 = no battery. Used by the Manager for dispatch and by "
                  "PowerRECO as the starting battery size.",
         )
         new_c_rate = b2.number_input(
             "C-rate", 0.1, 1.0, float(_so("c_rate", _active.c_rate)), step=0.1,
+            key=_wk + "c_rate",
         )
         new_bat_cost = b3.number_input(
             "Battery cost (RM/kWh)", 1500.0, 5000.0,
-            float(_so("batt_cost", 2500.0)), step=100.0,
+            float(_so("batt_cost", 2500.0)), step=100.0, key=_wk + "batt_cost",
         )
         b4, b5, b6 = st.columns(3)
         new_md_target = b4.slider(
             "MD target (% of ref peak)", 70, 95,
             int(_so("md_target_pct", _active.md_target_pct) * 100),
+            key=_wk + "md_target",
         ) / 100.0
         new_charge_upper = b5.slider(
             "Charge upper threshold (%)", 50, 90,
             int(_so("charge_upper_pct", _active.charge_upper_pct) * 100),
+            key=_wk + "charge_upper",
         ) / 100.0
         new_init_soc = b6.slider(
             "Initial SOC (%)", 20, 80,
             int(_so("init_soc_pct", _active.initial_soc_pct) * 100),
+            key=_wk + "init_soc",
         ) / 100.0
 
     with st.expander("🚙 EV chargers", expanded=False):
@@ -472,26 +699,30 @@ with tab0:
         new_ev_count = e1.number_input(
             "# chargers", 0, 100,
             int(_so("ev_count", _ev_charger.count if _ev_charger else 4)),
+            key=_wk + "ev_count",
         )
         new_ev_kw = e2.number_input(
             "kW each", 3.6, 250.0,
             float(_so("ev_kw_each", _ev_charger.kw_each if _ev_charger else 22.0)),
-            step=1.0,
+            step=1.0, key=_wk + "ev_kw",
         )
         new_ev_kind = e3.selectbox(
             "Connector",
             ["AC", "DC"],
             index=0 if _so("ev_kind", _ev_charger.kind if _ev_charger else "AC") == "AC" else 1,
+            key=_wk + "ev_kind",
         )
         e4, e5 = st.columns(2)
         _ev_window = _ev_default.allowed_window if (_ev_default and _ev_default.allowed_window) else (18, 8)
         new_ev_ws = e4.number_input(
             "Charge window start (h)", 0, 23,
             int(_so("ev_window_start", _ev_window[0])),
+            key=_wk + "ev_ws",
         )
         new_ev_we = e5.number_input(
             "Charge window end (h)",   0, 23,
             int(_so("ev_window_end",   _ev_window[1])),
+            key=_wk + "ev_we",
             help="Window wraps overnight: 18 → 8 means 18:00 to 08:00 next morning.",
         )
 
@@ -502,14 +733,17 @@ with tab0:
         new_hvac_protect_start = h1.number_input(
             "Protected from (h)", 0, 23,
             int(_so("hvac_protect_start", _hwin[0])),
+            key=_wk + "hvac_ws",
         )
         new_hvac_protect_end = h2.number_input(
             "Protected to (h)", 0, 23,
             int(_so("hvac_protect_end", _hwin[1])),
+            key=_wk + "hvac_we",
         )
         new_hvac_cut = h3.number_input(
             "Max cut % outside protect", 0, 100,
             int(_so("hvac_max_cut_pct", (_hvac.max_cut_pct * 100) if _hvac else 15)),
+            key=_wk + "hvac_cut",
         )
 
     with st.expander("💰 Tariff & financial", expanded=False):
@@ -520,19 +754,20 @@ with tab0:
             "Tariff code", tariff_options,
             index=tariff_options.index(_cur_tariff) if _cur_tariff in tariff_options else 2,
             format_func=lambda c: f"{c} — {TARIFF_META[c]['name']}",
+            key=_wk + "tariff",
             help="Auto-detected from your data, overridable here.",
         )
         new_icpt = t2.number_input(
             "ICPT (sen/kWh)", -10.0, 20.0,
-            float(_so("icpt_sen", 0.0)), step=0.5,
+            float(_so("icpt_sen", 0.0)), step=0.5, key=_wk + "icpt",
         )
         new_nem = t3.number_input(
             "NEM buyback rate (RM/kWh)", 0.20, 0.50,
-            float(_so("nem_rate", 0.31)), step=0.01,
+            float(_so("nem_rate", 0.31)), step=0.01, key=_wk + "nem",
         )
         new_budget = st.number_input(
             "Max CAPEX budget (RM, 0 = no cap)", 0, 5_000_000,
-            int(_so("budget_rm", 0)), step=50_000,
+            int(_so("budget_rm", 0)), step=50_000, key=_wk + "budget",
             help="Used by the PowerRECO optimizer to find the best NPV within budget.",
         )
 
@@ -614,6 +849,8 @@ with tab0:
                     )
                     metrics = fc.fit(st.session_state.df, verbose=False)
                     st.session_state.forecaster = fc
+                    # Persist freshly retrained model
+                    save_forecaster(st.session_state.site_profile_id, fc)
                     fr = fc.forecast(output_steps=48)
                     st.session_state.forecast_result = fr
 
@@ -752,9 +989,14 @@ with tab1:
             tariff_code, tariff_reason, tariff_stats = auto_detect_tariff(df)
             st.session_state.tariff_code = tariff_code
 
+            # Persist for the active site — survives browser refresh + restart.
+            _active_site = st.session_state.site_profile_id
+            save_load_profile(_active_site, df)
+
             st.success(f"Loaded {summ['rows']:,} intervals  |  "
                        f"{summ['days']} days  |  "
-                       f"Peak {summ['max_kw_import']:.1f} kW")
+                       f"Peak {summ['max_kw_import']:.1f} kW · "
+                       f"Saved to `data/sites/{_active_site}/load_profile.joblib`")
 
             col1, col2, col3 = st.columns(3)
             col1.metric("Mean kW", f"{summ['mean_kw_import']:.1f}")
@@ -869,10 +1111,13 @@ with tab2:
                     )
                     metrics = fc.fit(df, verbose=False)
                 st.session_state.forecaster = fc
+                # Persist so the model is ready next time the app opens
+                save_forecaster(st.session_state.site_profile_id, fc)
                 st.success(
                     f"Trained {metrics['n_models_trained']} models. "
                     f"Mean MAPE: {metrics['mean_mape']:.2f}%  |  "
-                    f"MAPE@24h: {metrics.get('mape_at_h24', 0):.2f}%"
+                    f"MAPE@24h: {metrics.get('mape_at_h24', 0):.2f}%  ·  "
+                    f"Saved to `data/sites/{st.session_state.site_profile_id}/forecaster.joblib`"
                 )
             except Exception as e:
                 st.error(f"Training failed: {e}")
@@ -959,6 +1204,436 @@ with tab2:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TAB LIVE: LIVE SIMULATION  (the "smarter every day" demo)
+# ─────────────────────────────────────────────────────────────────────────────
+with tab_live:
+    st.header("🔴 Live Forecast Simulation")
+    st.caption(
+        "Replays the held-out 30 % tail of your uploaded data tick-by-tick, "
+        "feeding each new reading to the trained model.  Every 12 ticks (6 h "
+        "of revealed data) a warm-start retrain fires.  The live KPIs below "
+        "should *sharpen visibly* as more data arrives — that's the "
+        "*'smarter every day'* story made real."
+    )
+
+    if st.session_state.df is None or st.session_state.forecaster is None:
+        st.warning(
+            "Need both an uploaded load profile and a trained forecaster. "
+            "Use the Data Upload + Predictor tabs first — or pick a site "
+            "with a saved model in the sidebar."
+        )
+        st.stop()
+
+    _fc_live = st.session_state.forecaster
+    _df_live = st.session_state.df
+
+    # ── Initialize the simulation lazily on first entry ─────────────────────
+    if st.session_state.sim_state is None:
+        try:
+            with st.spinner("Initialising live simulation (splitting data 70/30, seeding state)…"):
+                train_df, future_df = split_historical_for_simulation(
+                    _df_live, train_fraction=0.7,
+                )
+                # Re-seed forecaster.history to the train slice so revealed
+                # actuals from future_df aren't already in the model's view.
+                _fc_live.history = train_df.sort_values("timestamp").reset_index(drop=True)
+                st.session_state.sim_history_actuals = train_df.copy()
+                st.session_state.sim_state = initialize_simulation(
+                    _fc_live, future_df,
+                    retrain_every_n=12,
+                    warm_start_rounds=50,
+                )
+            st.success(
+                f"Sim ready · {len(train_df):,} rows historical · "
+                f"{len(future_df):,} rows reserved as future stream "
+                f"({len(future_df) // 48} days)"
+            )
+        except Exception as e:
+            st.error(f"Sim init failed: {e}")
+            st.code(traceback.format_exc())
+            st.stop()
+
+    sim = st.session_state.sim_state
+
+    # ── Controls (outside the live fragment — toggle state, not redraw constantly)
+    st.markdown("##### Playback")
+    b1, b2, b3, b4, b5, b6 = st.columns(6)
+
+    if b1.button("⏭ Next tick",     use_container_width=True,
+                  disabled=sim.is_finished, key="lsim_next"):
+        advance_one_tick(_fc_live, sim)
+        st.rerun()
+    if b2.button("⏩ +12 (6 h)",     use_container_width=True,
+                  disabled=sim.is_finished, key="lsim_12"):
+        for _ in range(12):
+            if sim.is_finished: break
+            advance_one_tick(_fc_live, sim)
+        st.rerun()
+    if b3.button("⏩ +48 (24 h)",    use_container_width=True,
+                  disabled=sim.is_finished, key="lsim_48"):
+        with st.spinner("Advancing 24 h of simulated time…"):
+            for _ in range(48):
+                if sim.is_finished: break
+                advance_one_tick(_fc_live, sim)
+        st.rerun()
+    if b4.button("⏯ Play/Pause",    use_container_width=True,
+                  disabled=sim.is_finished, key="lsim_play"):
+        st.session_state.sim_playing = not st.session_state.sim_playing
+        st.rerun()
+    if b5.button("🏁 Run to end",   use_container_width=True,
+                  disabled=sim.is_finished, key="lsim_end"):
+        with st.spinner(f"Replaying {sim.total_ticks - sim.tick:,} remaining ticks…"):
+            while not sim.is_finished:
+                advance_one_tick(_fc_live, sim)
+        st.rerun()
+    if b6.button("🔄 Reset sim",    use_container_width=True, key="lsim_reset"):
+        st.session_state.sim_state = None
+        st.session_state.sim_playing = False
+        st.rerun()
+
+    sp1, sp2 = st.columns([3, 2])
+    tick_speed = sp1.slider(
+        "Auto-play tick rate (seconds per refresh)",
+        min_value=0.2, max_value=2.0, value=0.5, step=0.1,
+        help="How often the live view refreshes when Play is on. "
+             "0.5 s ≈ 2 sim ticks per real second; 2.0 s ≈ 1 tick every 2 s "
+             "(easier to read for a live audience).",
+        key="lsim_tickrate",
+    )
+    sp2.markdown(
+        f"<div style='padding-top:24px'>"
+        f"{'<span style=\"color:#ef4444;font-weight:700\">● LIVE</span>'  + f' — updates every {tick_speed:.1f} s' if st.session_state.sim_playing and not sim.is_finished else '<span style=\"color:#9ca3af\">○ Paused</span>'}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── LIVE VIEW (in a fragment so only THIS section re-runs on the timer) ──
+    @st.fragment(run_every=f"{tick_speed:.1f}s")
+    def _live_view():
+        # Always pull the latest sim from session_state inside the fragment —
+        # the buttons above may have mutated it between renders.
+        sim = st.session_state.sim_state
+        fc  = st.session_state.forecaster
+        if sim is None or fc is None:
+            st.info("Sim was reset — initialising again on next render.")
+            return
+
+        # Auto-advance ONE tick per fragment cycle while Play is on.
+        # One tick / cycle keeps the chart moving smoothly; the tick_rate
+        # slider above controls the cycle interval.
+        if st.session_state.sim_playing and not sim.is_finished:
+            try:
+                advance_one_tick(fc, sim)
+            except Exception as e:
+                st.session_state.sim_playing = False
+                st.error(f"Tick failed: {e}")
+
+        # Re-run the AI Manager on the FRESH forecast so the Manager tab's
+        # live fragment sees an up-to-date dispatch plan.  Only recompute
+        # when the sim has actually advanced — saves CPU on idle frames.
+        if sim.tick != st.session_state.get("live_manager_last_tick"):
+            try:
+                _lm = _run_manager_on_live_forecast()
+                if _lm is not None:
+                    st.session_state.live_manager_results = _lm
+                    st.session_state.live_manager_last_tick = sim.tick
+            except Exception:
+                pass
+
+        # ── Status metrics ───────────────────────────────────────────────
+        s_c1, s_c2, s_c3, s_c4 = st.columns(4)
+        s_c1.metric("Tick",                f"{sim.tick:,} / {sim.total_ticks:,}")
+        s_c2.metric("Progress",            f"{sim.progress * 100:.1f} %")
+        s_c3.metric("Warm-start retrains", f"{len(sim.retrain_log)}")
+        if sim.is_finished:
+            s_c4.metric("Status", "✅ Finished")
+        elif st.session_state.sim_playing:
+            s_c4.metric("Status", "🔴 LIVE")
+        else:
+            s_c4.metric("Status", "⏸ Paused")
+        st.progress(float(sim.progress))
+
+        # ── Chart 1: Real vs predicted, real-time as it streams in ───────
+        st.subheader("📡 Real vs Predicted — live stream (24-h window)")
+        st.caption(
+            "Sliding 24-h window centered on **now** (the last revealed tick): "
+            "12 h of revealed actuals on the left, 12 h of forward forecast on "
+            "the right.  Window advances automatically as the sim ticks forward."
+        )
+
+        revealed = sim.revealed_data()
+        fr       = sim.current_forecast
+
+        # Anchor "now" to the last revealed timestamp (or the end of training
+        # history if no ticks yet).  Window = [now - 12h, now + 12h] = 24 h.
+        if fc.history is not None and len(fc.history) > 0:
+            now_ts = pd.to_datetime(fc.history["timestamp"].max())
+        elif fr is not None:
+            now_ts = pd.to_datetime(fr.last_history_ts)
+        else:
+            now_ts = pd.to_datetime(_df_live["timestamp"].max())
+        x_min = now_ts - pd.Timedelta(hours=12)
+        x_max = now_ts + pd.Timedelta(hours=12)
+
+        try:
+            fig_live = go.Figure()
+            # Revealed actuals — clipped to the visible 24-h window
+            if len(revealed) > 0:
+                rev_in = revealed[
+                    (revealed["timestamp"] >= x_min)
+                    & (revealed["timestamp"] <= now_ts)
+                ]
+                if len(rev_in) > 0:
+                    fig_live.add_trace(go.Scatter(
+                        x=rev_in["timestamp"], y=rev_in["kw_import"],
+                        mode="lines+markers", name="Revealed actuals",
+                        line=dict(color="#22c55e", width=2.5),
+                        marker=dict(size=3),
+                    ))
+            # If the window's left half isn't yet filled by sim ticks, blend in
+            # the training history that falls inside [x_min, now_ts].
+            train_full = (st.session_state.sim_history_actuals
+                          if st.session_state.sim_history_actuals is not None
+                          else _df_live)
+            train_in = train_full[
+                (train_full["timestamp"] >= x_min)
+                & (train_full["timestamp"] <= now_ts)
+            ]
+            if len(train_in) > 0:
+                fig_live.add_trace(go.Scatter(
+                    x=train_in["timestamp"], y=train_in["kw_import"],
+                    mode="lines", name="Training history (pre-sim)",
+                    line=dict(color="#6b7a9a", width=1, dash="dot"),
+                ))
+            # Forecast: P10-P90 band + median — clipped to next 12 h
+            if fr is not None:
+                fts = pd.to_datetime(list(fr.timestamps))
+                mask = (fts >= now_ts) & (fts <= x_max)
+                fts_v = fts[mask]
+                med_v = fr.median[mask]
+                p10_v = fr.p10[mask]
+                p90_v = fr.p90[mask]
+                if len(fts_v) > 0:
+                    fig_live.add_trace(go.Scatter(
+                        x=list(fts_v) + list(fts_v[::-1]),
+                        y=list(p90_v) + list(p10_v[::-1]),
+                        fill="toself", fillcolor="rgba(0,212,255,0.15)",
+                        line=dict(color="rgba(255,255,255,0)"),
+                        name="P10–P90 band",
+                    ))
+                    fig_live.add_trace(go.Scatter(
+                        x=fts_v, y=med_v,
+                        mode="lines", name="Median forecast",
+                        line=dict(color="#00d4ff", width=2.5),
+                    ))
+            # Vertical "now" marker.  Plotly's add_vline does internal
+            # date arithmetic that breaks on numpy 2 + pandas 3, and mixing
+            # ISO strings with Timestamp axes throws a different error.
+            # Drawing it as a regular Scatter trace sidesteps both code paths.
+            _now_yvals = []
+            if len(revealed) > 0:
+                _now_yvals.append(float(revealed["kw_import"].max()))
+            if fr is not None:
+                _now_yvals.append(float(fr.p90.max()))
+            y_top = (max(_now_yvals) * 1.05) if _now_yvals else 100.0
+            fig_live.add_trace(go.Scatter(
+                x=[now_ts, now_ts], y=[0, y_top],
+                mode="lines", name="● now",
+                line=dict(color="#ef4444", width=2),
+                hoverinfo="skip",
+            ))
+            # Retrain markers — only the ones inside the visible window
+            if sim.retrain_log:
+                try:
+                    ret_pairs = []
+                    for r in sim.retrain_log:
+                        ts = pd.to_datetime(r["reveal_ts"])
+                        if not (x_min <= ts <= now_ts):
+                            continue
+                        match = _df_live.loc[_df_live["timestamp"] == ts, "kw_import"]
+                        if len(match):
+                            ret_pairs.append((ts, float(match.iloc[0])))
+                    if ret_pairs:
+                        fig_live.add_trace(go.Scatter(
+                            x=[p[0] for p in ret_pairs],
+                            y=[p[1] for p in ret_pairs],
+                            mode="markers", name="Warm-start retrain",
+                            marker=dict(symbol="star", size=15, color="#f59e0b",
+                                        line=dict(color="#92400e", width=1.5)),
+                        ))
+                except Exception:
+                    pass
+            fig_live.update_layout(
+                # Pass Timestamps directly — Plotly's Scatter-x route handles
+                # them.  (The earlier add_vline path was the broken one; the
+                # axis-range path is fine.)
+                xaxis=dict(title="Time", range=[x_min, x_max]),
+                yaxis_title="kW",
+                hovermode="x unified", height=420,
+                legend=dict(orientation="h", yanchor="bottom", y=1.02),
+            )
+            st.plotly_chart(fig_live, use_container_width=True,
+                             key=f"live_chart_{sim.tick}")
+        except Exception as e:
+            st.warning(f"Live chart render failed: {e}")
+
+        # ── Chart 2: Predicted-vs-actual log (each tick adds verified points)
+        try:
+            verified = pd.DataFrame([
+                r for r in sim.forecast_log if r["actual"] is not None
+                and r["horizon_steps"] == 1     # the "30-min-ahead" view
+            ])
+            if len(verified) > 0:
+                verified = verified.sort_values("target_ts").reset_index(drop=True)
+                st.subheader("🎯 Forecast accuracy log — predicted vs actual")
+                st.caption(
+                    f"For every revealed actual, the chart shows the model's "
+                    f"h=1 forecast made 30 min earlier (cyan) vs what really "
+                    f"happened (green). Lines hugging each other = high accuracy. "
+                    f"This is what your live audience cares about. ({len(verified)} "
+                    f"verified pairs so far.)"
+                )
+                fig_pa = go.Figure()
+                fig_pa.add_trace(go.Scatter(
+                    x=verified["target_ts"], y=verified["actual"],
+                    mode="lines+markers", name="Actual",
+                    line=dict(color="#22c55e", width=2.5),
+                    marker=dict(size=4),
+                ))
+                fig_pa.add_trace(go.Scatter(
+                    x=verified["target_ts"], y=verified["median"],
+                    mode="lines+markers", name="Predicted (h=1 forecast)",
+                    line=dict(color="#00d4ff", width=2, dash="dash"),
+                    marker=dict(size=3, symbol="diamond"),
+                ))
+                fig_pa.add_trace(go.Scatter(
+                    x=list(verified["target_ts"]) + list(verified["target_ts"][::-1]),
+                    y=list(verified["p90"]) + list(verified["p10"][::-1]),
+                    fill="toself", fillcolor="rgba(0,212,255,0.10)",
+                    line=dict(color="rgba(255,255,255,0)"),
+                    name="P10–P90 (predicted band)",
+                ))
+                fig_pa.update_layout(
+                    xaxis_title="Time", yaxis_title="kW",
+                    hovermode="x unified", height=340,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                )
+                st.plotly_chart(fig_pa, use_container_width=True,
+                                 key=f"pa_chart_{sim.tick}")
+        except Exception as e:
+            st.caption(f"(Predicted-vs-actual chart unavailable: {e})")
+
+        # ── KPIs ──────────────────────────────────────────────────────────
+        acc = compute_running_accuracy(sim)
+        st.subheader("🎯 Live Accuracy")
+        if not acc.get("n_verified"):
+            st.info("Advance the simulation to accumulate verified rows.")
+        else:
+            ak1, ak2, ak3, ak4 = st.columns(4)
+            ak1.metric("Verified rows",   f"{acc['n_verified']:,}")
+            ak2.metric("Overall MAE",      f"{acc['overall_mae']:.1f} kW")
+            ak3.metric("Overall MAPE",     f"{acc['overall_mape']:.2f} %")
+            cov = acc["within_80ci_pct"] or 0
+            ak4.metric("P10–P90 coverage", f"{cov:.1f} %",
+                        delta=f"{cov - 80:+.1f} vs 80% target",
+                        delta_color="normal" if 75 <= cov <= 90 else "inverse")
+
+            by_h = acc.get("by_horizon", {})
+            if by_h:
+                hkeys = sorted(by_h.keys())
+                fig_h = go.Figure(go.Bar(
+                    x=[f"h={h} ({h*30}min)" for h in hkeys],
+                    y=[by_h[h]["mape"] for h in hkeys],
+                    marker_color="#00d4ff",
+                ))
+                fig_h.update_layout(
+                    title="Per-horizon MAPE — closer in time = more accurate",
+                    xaxis_title="Forecast horizon", yaxis_title="MAPE %",
+                    height=300,
+                )
+                st.plotly_chart(fig_h, use_container_width=True,
+                                 key=f"h_chart_{sim.tick}")
+
+            # Rolling MAPE-over-time (smarter every day proof)
+            try:
+                verified_all = pd.DataFrame([
+                    r for r in sim.forecast_log if r["actual"] is not None
+                ])
+                if len(verified_all) >= 24:
+                    verified_all = verified_all.sort_values("target_ts").reset_index(drop=True)
+                    verified_all["err_pct"] = (
+                        (verified_all["median"] - verified_all["actual"]).abs()
+                        / verified_all["actual"].clip(lower=1.0)
+                    ) * 100
+                    verified_all["mape_rolling"] = (
+                        verified_all["err_pct"].rolling(24, min_periods=12).mean()
+                    )
+                    fig_t = go.Figure(go.Scatter(
+                        x=verified_all["target_ts"], y=verified_all["mape_rolling"],
+                        mode="lines", line=dict(color="#22c55e", width=2.5),
+                    ))
+                    for r in sim.retrain_log:
+                        fig_t.add_vline(x=r["reveal_ts"], line_dash="dot",
+                                          line_color="#f59e0b", line_width=1)
+                    fig_t.update_layout(
+                        title="Live MAPE over time — should trend down with each retrain",
+                        xaxis_title="Time of revealed actual",
+                        yaxis_title="Rolling MAPE %",
+                        height=300, showlegend=False,
+                    )
+                    st.plotly_chart(fig_t, use_container_width=True,
+                                     key=f"t_chart_{sim.tick}")
+            except Exception:
+                pass
+
+    # Mount the fragment
+    _live_view()
+
+    # ── Replace the future stream with a fresh CSV ──────────────────────────
+    with st.expander("📥 Replace future stream from a CSV (advanced)"):
+        st.caption(
+            "Upload a separate file containing only the *future* readings you "
+            "want to feed in tick-by-tick.  Use the same canonical schema as "
+            "the main upload (timestamp + kw_import + kvar_import etc.). "
+            "This resets the current sim."
+        )
+        live_csv = st.file_uploader(
+            "Future-stream CSV/Excel",
+            type=["csv", "xlsx", "xls"], key="live_stream_upload",
+        )
+        if live_csv is not None:
+            try:
+                future_bytes = live_csv.read()
+                from manager.optimizer import parse_uploaded_data
+                future_df_user = parse_uploaded_data(future_bytes, live_csv.name)
+                for col in ("kw_net", "kvar_net", "kva"):
+                    if col in future_df_user.columns:
+                        future_df_user = future_df_user.drop(columns=[col])
+                # Restart the sim with the uploaded future stream.  Use an
+                # explicit None check — `df_a or df_b` raises on DataFrames
+                # because they have no single truth value.
+                _hist_for_sim = (
+                    st.session_state.sim_history_actuals
+                    if st.session_state.sim_history_actuals is not None
+                    else _df_live
+                )
+                _fc_live.history = (_hist_for_sim
+                                     .sort_values("timestamp")
+                                     .reset_index(drop=True))
+                st.session_state.sim_state = initialize_simulation(
+                    _fc_live, future_df_user,
+                    retrain_every_n=12, warm_start_rounds=50,
+                )
+                st.success(
+                    f"Future stream replaced — {len(future_df_user):,} rows "
+                    f"({len(future_df_user) // 48} days).  Hit Play to advance."
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not parse future-stream file: {e}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # TAB 3: AI MANAGER
 # ─────────────────────────────────────────────────────────────────────────────
 with tab3:
@@ -966,6 +1641,247 @@ with tab3:
     st.caption(
         "Runs peak-shaving and load-shifting optimization on the loaded data. "
         "Uses the exact discharge formula: dis_kw = kW − √(trigger² − kVAR²)."
+    )
+
+    # ═════════════════════════════════════════════════════════════════════
+    # LIVE FORWARD STRATEGY — re-renders every sim tick from the same
+    # forecast the Live Simulation tab is advancing.  When the sim is
+    # paused or hasn't been started, this shows the most recent computed
+    # plan (or an empty state).
+    # ═════════════════════════════════════════════════════════════════════
+    _mgr_tick_rate = float(st.session_state.get("lsim_tickrate", 0.5))
+
+    @st.fragment(run_every=f"{_mgr_tick_rate:.1f}s")
+    def _live_manager_view():
+        # Make sure we have a Manager plan to draw — try once if missing.
+        results = st.session_state.get("live_manager_results")
+        if results is None or len(results) == 0:
+            _maybe = _run_manager_on_live_forecast()
+            if _maybe:
+                st.session_state.live_manager_results = _maybe
+                results = _maybe
+
+        if results is None or len(results) == 0:
+            st.info(
+                "Live strategy will appear once you (1) train a forecaster, "
+                "(2) open the **🔴 Live Simulation** tab to initialise the sim, "
+                "and (3) hit Play.  Every tick the Manager re-optimises "
+                "against the fresh forecast — KPIs and charts below update "
+                "automatically."
+            )
+            return
+
+        sim = st.session_state.get("sim_state")
+        sim_label = (
+            f"sim tick {sim.tick:,}/{sim.total_ticks:,}" if sim is not None else "static plan"
+        )
+        st.markdown(
+            f"##### 🔴 Live Forward Strategy "
+            f"<span style='color:#9ca3af;font-weight:400;font-size:13px'>"
+            f"({len(results)} forecast intervals · {sim_label})</span>",
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "The Manager re-optimises against the latest 24-h forecast on every "
+            "sim tick.  Lines = forecast / target / managed peak.  Stacked bars = "
+            "per-load kVA after dispatch.  Battery action shown below.  "
+            "Action log at the bottom lists every discharge, charge, and "
+            "load-trim decision in the current plan."
+        )
+
+        # ── Build flat result df ────────────────────────────────────────
+        res_df = pd.DataFrame([
+            {k: v for k, v in r.items() if k != "actions"} for r in results
+        ])
+        res_df["timestamp"] = pd.to_datetime(res_df["timestamp"])
+
+        # ── General KPIs ────────────────────────────────────────────────
+        forecast_peak = float(res_df["kva_original"].max())
+        managed_peak  = float(res_df["kva_managed"].max())
+        peak_red_pct  = (
+            (forecast_peak - managed_peak) / forecast_peak * 100
+            if forecast_peak > 0 else 0.0
+        )
+        bat_dis_kwh   = float(res_df["battery_discharge_kw"].sum()) * 0.5
+        # MD reduction uses kW rather than kVA since TNB MD bills on kW
+        kw_orig_peak   = float(res_df["kw_original"].max()) if "kw_original" in res_df.columns else forecast_peak
+        kw_managed_peak = float(res_df["kw_managed"].max())  if "kw_managed"  in res_df.columns else managed_peak
+        md_red_pct = (
+            (kw_orig_peak - kw_managed_peak) / kw_orig_peak * 100
+            if kw_orig_peak > 0 else 0.0
+        )
+
+        k1, k2, k3, k4, k5 = st.columns(5)
+        k1.metric("Forecast peak",    f"{forecast_peak:,.0f} kVA")
+        k2.metric("Managed peak",     f"{managed_peak:,.0f} kVA",
+                   delta=f"−{peak_red_pct:.1f}%", delta_color="inverse")
+        k3.metric("Peak reduction",   f"{peak_red_pct:.1f}%")
+        k4.metric("Battery discharged", f"{bat_dis_kwh:,.1f} kWh")
+        k5.metric("MD reduction (kW)", f"{md_red_pct:.1f}%")
+
+        # ── Load Optimize Graph (2 sub-rows) ────────────────────────────
+        from plotly.subplots import make_subplots
+        st.markdown("##### 📊 Load Optimize")
+        load_keys = [
+            c.replace("_managed", "")
+            for c in res_df.columns
+            if c.endswith("_managed")
+            and c not in ("kw_managed", "kvar_managed", "kva_managed")
+        ]
+        palette = ["#00b4d8", "#f59e0b", "#a78bfa",
+                    "#22c55e", "#f97316", "#ec4899"]
+
+        fig_lo = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            vertical_spacing=0.06, row_heights=[0.66, 0.34],
+            subplot_titles=("Load profile (kVA)", "Battery action (kW, +charge / −discharge)"),
+        )
+        # Stacked per-load kVA bars first so the lines render on top
+        for i, lk in enumerate(load_keys):
+            col = f"{lk}_managed"
+            if col in res_df.columns:
+                fig_lo.add_trace(go.Bar(
+                    x=res_df["timestamp"], y=res_df[col],
+                    name=f"{lk} (managed)",
+                    marker_color=palette[i % len(palette)],
+                    opacity=0.55,
+                ), row=1, col=1)
+        # Lines: forecast peak (original), target peak, managed peak
+        fig_lo.add_trace(go.Scatter(
+            x=res_df["timestamp"], y=res_df["kva_original"],
+            mode="lines", name="Forecast peak (kVA)",
+            line=dict(color="#ef4444", width=2.5),
+        ), row=1, col=1)
+        if "target_peak" in res_df.columns:
+            fig_lo.add_trace(go.Scatter(
+                x=res_df["timestamp"], y=res_df["target_peak"],
+                mode="lines", name="Target peak",
+                line=dict(color="#22c55e", width=2, dash="dash"),
+            ), row=1, col=1)
+        fig_lo.add_trace(go.Scatter(
+            x=res_df["timestamp"], y=res_df["kva_managed"],
+            mode="lines", name="Managed peak (kVA)",
+            line=dict(color="#00d4ff", width=2.5),
+        ), row=1, col=1)
+        # Battery action: charge positive, discharge negative
+        fig_lo.add_trace(go.Bar(
+            x=res_df["timestamp"], y=res_df["battery_charge_kw"],
+            name="Battery charge",
+            marker_color="#22c55e",
+        ), row=2, col=1)
+        fig_lo.add_trace(go.Bar(
+            x=res_df["timestamp"], y=-res_df["battery_discharge_kw"],
+            name="Battery discharge",
+            marker_color="#ef4444",
+        ), row=2, col=1)
+        fig_lo.update_layout(
+            height=520, barmode="stack",
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.06,
+                         xanchor="left", x=0),
+        )
+        fig_lo.update_xaxes(title_text="Time",   row=2, col=1)
+        fig_lo.update_yaxes(title_text="kVA",    row=1, col=1)
+        fig_lo.update_yaxes(title_text="kW",     row=2, col=1)
+        st.plotly_chart(
+            fig_lo, use_container_width=True,
+            key=f"mgr_lo_{len(results)}_{st.session_state.live_manager_last_tick}",
+        )
+
+        # ── Battery panel ───────────────────────────────────────────────
+        st.markdown("##### 🔋 Battery")
+        fig_bat = make_subplots(
+            rows=2, cols=1, shared_xaxes=True,
+            vertical_spacing=0.06, row_heights=[0.55, 0.45],
+            subplot_titles=("State of charge (%)", "Charging / discharging (kW)"),
+        )
+        fig_bat.add_trace(go.Scatter(
+            x=res_df["timestamp"], y=res_df["battery_soc_pct"],
+            mode="lines", name="SOC %",
+            line=dict(color="#a78bfa", width=2.5),
+            fill="tozeroy", fillcolor="rgba(167,139,250,0.18)",
+        ), row=1, col=1)
+        fig_bat.add_trace(go.Bar(
+            x=res_df["timestamp"], y=res_df["battery_charge_kw"],
+            name="Charge",  marker_color="#22c55e",
+        ), row=2, col=1)
+        fig_bat.add_trace(go.Bar(
+            x=res_df["timestamp"], y=-res_df["battery_discharge_kw"],
+            name="Discharge", marker_color="#ef4444",
+        ), row=2, col=1)
+        fig_bat.update_layout(
+            height=400, hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.05),
+        )
+        fig_bat.update_xaxes(title_text="Time", row=2, col=1)
+        fig_bat.update_yaxes(title_text="SOC %", row=1, col=1, range=[0, 100])
+        fig_bat.update_yaxes(title_text="kW",    row=2, col=1)
+        st.plotly_chart(
+            fig_bat, use_container_width=True,
+            key=f"mgr_bat_{len(results)}_{st.session_state.live_manager_last_tick}",
+        )
+
+        # ── Action log ─────────────────────────────────────────────────
+        st.markdown("##### 📜 Action Log")
+        log_rows: list[dict] = []
+        for r in results:
+            ts_label = pd.to_datetime(r["timestamp"]).strftime("%Y-%m-%d %H:%M")
+            for a in r.get("actions", []):
+                kind = a.get("type", "?")
+                if kind == "battery_discharge":
+                    detail = (
+                        f"Discharge {a.get('discharge_kw', 0):.1f} kW · "
+                        f"SOC {a.get('soc_before_kwh', 0):.0f}→{a.get('soc_after_kwh', 0):.0f} kWh"
+                        + (" · look-ahead" if a.get("lookahead_triggered") else "")
+                        + (" · MD-hrs" if a.get("md_hours") else "")
+                    )
+                    icon = "🔻"
+                elif kind == "battery_charge":
+                    detail = (
+                        f"Charge {a.get('charge_kw', 0):.1f} kW · "
+                        f"{a.get('charge_trigger', '')} · "
+                        f"SOC {a.get('soc_before_kwh', 0):.0f}→{a.get('soc_after_kwh', 0):.0f} kWh"
+                    )
+                    icon = "🔺"
+                elif kind == "load_reduction":
+                    detail = (
+                        f"Cut {a.get('cut_kva', 0):.1f} kVA "
+                        f"from {a.get('load', '?')} "
+                        f"(reason: {a.get('reason', 'normal')}, "
+                        f"factor {a.get('factor_pct', 0):.0f}%)"
+                    )
+                    icon = "✂️"
+                else:
+                    detail = str(a)
+                    icon   = "•"
+                log_rows.append({
+                    "Time":    ts_label,
+                    "":        icon,
+                    "Action":  kind.replace("_", " "),
+                    "Load":    a.get("load", "—"),
+                    "Detail":  detail,
+                })
+
+        if log_rows:
+            # Most recent first, capped at 50 to keep the table fast
+            log_df = pd.DataFrame(log_rows[::-1][:50])
+            st.dataframe(log_df, use_container_width=True, hide_index=True, height=300)
+            st.caption(f"{len(log_rows)} total actions across the 24-h plan · showing latest 50.")
+        else:
+            st.caption(
+                "No actions in the current forecast horizon — load stays below "
+                "the discharge trigger, and the battery sits idle.  "
+                "Lower the **MD target %** in Site Setup to make the strategy "
+                "more aggressive."
+            )
+
+    _live_manager_view()
+
+    st.divider()
+    st.markdown("##### 🛠️ Manual run on historical data")
+    st.caption(
+        "Use this for after-the-fact 'what if we'd been active' analysis on "
+        "the uploaded load profile.  Independent of the live forward strategy."
     )
 
     if st.session_state.df is None:

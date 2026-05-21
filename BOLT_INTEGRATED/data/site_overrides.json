@@ -1,0 +1,31 @@
+{
+  "custom": {},
+  "e": {
+    "batt_cost": 2500.0,
+    "battery_kwh": 300.0,
+    "budget_rm": 0,
+    "c_rate": 0.5,
+    "charge_upper_pct": 0.7,
+    "ev_count": 4,
+    "ev_kind": "AC",
+    "ev_kw_each": 22.0,
+    "ev_window_end": 8,
+    "ev_window_start": 18,
+    "hvac_max_cut_pct": 15,
+    "hvac_protect_end": 17,
+    "hvac_protect_start": 9,
+    "icpt_sen": 0.0,
+    "init_soc_pct": 0.5,
+    "lat": 3.1116,
+    "lon": 101.653,
+    "md_target_pct": 0.85,
+    "nem_rate": 0.31,
+    "panel_w": 415,
+    "psh": 4.5,
+    "roof_area_m2": 2000.0,
+    "solar_cost": 3500.0,
+    "solar_kwp": 0.0,
+    "tariff_code": "C1",
+    "timezone": "auto"
+  }
+}

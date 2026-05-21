@@ -65,7 +65,12 @@ from site_profiles import (
     DEFAULT_PROFILE_ID,
 )
 
-from persistence import load_overrides, save_overrides, OVERRIDES_PATH
+from persistence import (
+    load_overrides, save_overrides, OVERRIDES_PATH,
+    save_load_profile, load_load_profile,
+    save_forecaster,   load_forecaster,
+    site_state_info,
+)
 
 # ── Shared application state ──────────────────────────────────────────────────
 # Hydrate site overrides from disk on import so a server restart preserves
@@ -73,7 +78,91 @@ from persistence import load_overrides, save_overrides, OVERRIDES_PATH
 S: dict = {
     'site_overrides':  load_overrides(),     # {site_id: {field: value}}
     'use_real_weather': True,                # default-on; toggle via /api/site/configure
+    'site_profile_id': DEFAULT_PROFILE_ID,
 }
+
+
+def _hydrate_site_from_disk(site_id: str) -> dict:
+    """Load saved data + forecaster for `site_id` into S.  Returns a small
+    summary dict for logging.  Safe to call multiple times — no-op when
+    the same site is already loaded.
+    """
+    if S.get('_loaded_site_id') == site_id:
+        return {'cached': True}
+    # Reset per-site mutable state
+    for k in ('df', 'file_summary', 'forecaster', 'forecast_result', 'sim_state',
+              'manager_results', 'manager_summary', 'manager_day_sums',
+              'bill_rows', 'bill_summary', 'roi', 'solar_result', 'batt_result',
+              'sizing_sweep', 'live_accuracy'):
+        S.pop(k, None)
+
+    summary = {'data_loaded': False, 'model_loaded': False}
+    saved_df = load_load_profile(site_id)
+    if saved_df is not None and len(saved_df) > 0:
+        S['df'] = saved_df
+        # Mirror the summary the upload endpoint would have produced
+        try:
+            def _f(v, d=0.0):
+                try:
+                    x = float(v); return d if (math.isnan(x) or math.isinf(x)) else x
+                except Exception: return d
+            dates = sorted(saved_df['timestamp'].dt.date.astype(str).unique().tolist())
+            S['file_summary'] = {
+                'rows':           len(saved_df),
+                'days':           len(dates),
+                'start':          dates[0] if dates else '',
+                'end':            dates[-1] if dates else '',
+                'max_kw_import':  round(_f(saved_df['kw_import'].max()), 2),
+                'mean_kw_import': round(_f(saved_df['kw_import'].mean()), 2),
+                'peak_kva':       round(_f(saved_df['kva'].max()), 2) if 'kva' in saved_df.columns else 0,
+            }
+        except Exception:
+            pass
+        try:
+            tc, _, _ = auto_detect_tariff(saved_df); S['tariff_code'] = tc
+        except Exception:
+            pass
+        summary['data_loaded'] = True
+        summary['data_rows']   = len(saved_df)
+
+    saved_fc = load_forecaster(site_id)
+    if saved_fc is not None:
+        S['forecaster'] = saved_fc
+        try:
+            # Build a fresh sim_state if we also have data, so the pipeline
+            # is immediately ready to tick once the user starts it.
+            if S.get('df') is not None:
+                tdf, fdf = split_historical_for_simulation(
+                    S['df'][['timestamp','kw_import','kw_export','kvar_import','kvar_export']]
+                      if all(c in S['df'].columns for c in ('kw_export','kvar_import','kvar_export'))
+                      else S['df'],
+                    train_fraction=0.7,
+                )
+                # Re-seed the forecaster's history to the train slice so live
+                # ticks reveal future_df rows, matching the original train flow.
+                S['forecaster'].history = tdf.copy().sort_values('timestamp').reset_index(drop=True)
+                S['sim_state'] = initialize_simulation(S['forecaster'], fdf,
+                                                       retrain_every_n=12,
+                                                       warm_start_rounds=50)
+                S['forecast_result'] = S['sim_state'].current_forecast
+                S['live_accuracy']   = compute_running_accuracy(S['sim_state'])
+            else:
+                S['forecast_result'] = saved_fc.forecast(output_steps=48)
+            summary['model_loaded'] = True
+        except Exception as e:
+            # Saved model exists but predict/sim init failed — drop it.
+            S.pop('forecaster',      None)
+            S.pop('forecast_result', None)
+            S.pop('sim_state',       None)
+            summary['model_load_error'] = str(e)
+
+    S['_loaded_site_id'] = site_id
+    return summary
+
+
+# Hydrate the default site at boot
+_boot_summary = _hydrate_site_from_disk(S['site_profile_id'])
+print(f"[boot] site={S['site_profile_id']} state={_boot_summary}")
 PL: dict = {          # pipeline control state
     'running':          False,
     'status':           'idle',     # idle | training | forecasting | optimizing | billing | powerreco | error
@@ -773,6 +862,8 @@ def api_site_select():
     # on the next tick (user can override again via /api/pipeline/configure).
     S.pop('pipeline_loads', None)
     S.pop('pipeline_priority', None)
+    # Hydrate data + forecaster for the newly selected site
+    _hyd = _hydrate_site_from_disk(sid)
     prof = get_profile(sid)
     return _ok({
         'id':   prof.id,
@@ -820,6 +911,8 @@ def api_upload():
     S['file_summary']={'rows':len(df),'days':len(dates),'start':dates[0] if dates else '',
         'end':dates[-1] if dates else '','max_kw_import':round(_sf(df['kw_import'].max()),2),
         'mean_kw_import':round(_sf(df['kw_import'].mean()),2),'peak_kva':round(_sf(df['kva'].max()),2)}
+    # Persist for the active site so future server restarts skip re-upload
+    save_load_profile(S.get('site_profile_id', DEFAULT_PROFILE_ID), df)
     return _ok({'success':True,'records':records,'dates':dates,
                 'total_intervals':len(records),'peak_kva':round(_sf(df['kva'].max()),2),
                 'avg_kva':round(_sf(df['kva'].mean()),2),
@@ -882,6 +975,8 @@ def api_predictor_train():
         fc = DirectMultiStepForecaster(capacity_kwp=kwp, **fc_kwargs)
         m = fc.fit(train_df, verbose=False)
         S['forecaster'] = fc
+        # Persist trained model so it's ready next server boot
+        save_forecaster(S.get('site_profile_id', DEFAULT_PROFILE_ID), fc)
 
         # Spin up the live simulation. Each pipeline tick consumes one row
         # from future_df, warm-starts retrain every retrain_every_n ticks,
