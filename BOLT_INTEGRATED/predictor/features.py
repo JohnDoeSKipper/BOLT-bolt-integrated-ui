@@ -8,8 +8,10 @@ import numpy as np
 import pandas as pd
 
 
-# Lags in units of 30-min steps (the data frequency)
-DEFAULT_LAGS = [1, 2, 4, 8, 16, 24, 48, 96, 336]  # 30min, 1h, 2h, 4h, 8h, 12h, 24h, 48h, 1 week
+# Lags in units of 30-min steps (the data frequency).
+#  1=30min  2=1h  4=2h  8=4h  16=8h  24=12h  48=24h  96=48h
+#  336=1week   672=2weeks    ← added 2026-05-22 for monthly-pattern capture
+DEFAULT_LAGS = [1, 2, 4, 8, 16, 24, 48, 96, 336, 672]
 
 
 # Malaysian fixed public holidays — plus the major lunar holidays. Lunar
@@ -143,6 +145,25 @@ def add_schedule_features(df: pd.DataFrame, target: str = "kw_import") -> pd.Dat
     return out
 
 
+def add_ewma_features(df: pd.DataFrame, target: str = "kw_import") -> pd.DataFrame:
+    """Exponentially-weighted moving averages at three decay rates.
+
+    EWMA gives the model a smoothed view of recent trend that complements
+    the snapshot lag features.  Three spans capture different operational
+    horizons:
+      • span=4   ≈ 2 h smoothing — recent activity
+      • span=16  ≈ 8 h           — half-day trend
+      • span=96  ≈ 48 h          — multi-day baseline
+    All inputs are shifted-1 so no current-row leakage.
+    """
+    out = df.copy()
+    s = out[target].shift(1)
+    out["ewma_2h"]  = s.ewm(span=4,  adjust=False, min_periods=1).mean()
+    out["ewma_8h"]  = s.ewm(span=16, adjust=False, min_periods=1).mean()
+    out["ewma_48h"] = s.ewm(span=96, adjust=False, min_periods=1).mean()
+    return out
+
+
 def add_regime_features(df: pd.DataFrame, target: str = "kw_import") -> pd.DataFrame:
     """
     Regime-shift signals: tell the trees how today compares to history.
@@ -158,6 +179,7 @@ def add_regime_features(df: pd.DataFrame, target: str = "kw_import") -> pd.DataF
     s = out[target]
     out["delta_vs_24h"] = s.shift(1) - s.shift(48)
     out["delta_vs_7d"]  = s.shift(1) - s.shift(336)
+    out["delta_vs_14d"] = s.shift(1) - s.shift(672)        # added 2026-05-22
     # Recent rolling mean vs the long-run dow_hour baseline.
     # Both inputs are already shifted-1 (rolling) and historical (groupby
     # transform), so no current-row leakage.
@@ -389,6 +411,7 @@ def build_feature_matrix(
     out = add_time_features(df)
     out = add_lag_features(out, target=target)
     out = add_rolling_features(out, target=target)
+    out = add_ewma_features(out, target=target)               # NEW 2026-05-22
     out = add_schedule_features(out, target=target)
     out = add_regime_features(out, target=target)
 
@@ -434,8 +457,9 @@ def build_feature_matrix(
         *[f"lag_{L}" for L in DEFAULT_LAGS],
         "roll_mean_24", "roll_mean_48", "roll_std_48", "roll_max_48", "roll_min_48",
         "roll_mean_336",
+        "ewma_2h", "ewma_8h", "ewma_48h",        # NEW 2026-05-22
         "dow_hour_mean", "dow_hour_std", "same_dow_hour_4w_mean",
-        "delta_vs_24h", "delta_vs_7d", "recent_vs_schedule",
+        "delta_vs_24h", "delta_vs_7d", "delta_vs_14d", "recent_vs_schedule",
         "solar_capacity_kwp", "est_solar_gen_kw", "has_solar",
         "solar_irrad_w_m2", "solar_irrad_ratio",
         "est_temp_c", "is_hot_period",

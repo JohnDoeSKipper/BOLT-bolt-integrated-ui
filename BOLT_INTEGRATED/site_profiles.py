@@ -57,7 +57,7 @@ class LoadDefinition:
 @dataclass
 class PredictorParams:
     """Forecaster tuning knobs — per-site values from master's eval runs."""
-    n_estimators: int = 200
+    n_estimators: int = 300            # bumped from 200 (early stopping caps actual rounds)
     learning_rate: float = 0.05
     h_cap_short: float = 1.6
     h_cap_mid: float = 1.0
@@ -156,12 +156,15 @@ SOL = SiteProfile(
     description=(
         "Commercial site with installed solar PV (~944 kWp from the original "
         "case study). Volatile net-load shape from cloud cover, so the "
-        "forecaster uses a tight bias window (8) to track regime shifts."
+        "forecaster uses a tight bias window (8) to track regime shifts.  "
+        "tail_min_child bumped to 10 for smoother quantile bands under "
+        "high cloud-cover variance."
     ),
     expected_tariff="C1",
     expected_solar_kwp=944.0,
     expected_roof_area_m2=1500.0,
-    predictor=PredictorParams(n_estimators=200, bias_window=8),
+    predictor=PredictorParams(n_estimators=300, bias_window=8,
+                                tail_min_child=10, body_min_child=18),
     loads=_default_loads(),
     data_hint="1. Load Profile (With Solar Installed) SoL.xlsx",
 )
@@ -177,7 +180,7 @@ E = SiteProfile(
     expected_tariff="C1",
     expected_solar_kwp=0.0,
     expected_roof_area_m2=2000.0,
-    predictor=PredictorParams(n_estimators=200, bias_window=24),
+    predictor=PredictorParams(n_estimators=300, bias_window=24),
     battery_kwh=300.0,
     loads=_default_loads(),
     data_hint="2. Load Profile (No Solar) E.xlsx",
@@ -196,7 +199,7 @@ SUN = SiteProfile(
     expected_solar_kwp=0.0,
     expected_roof_area_m2=600.0,
     predictor=PredictorParams(
-        n_estimators=160,
+        n_estimators=240,
         h_cap_long_short=0.6,
         h_cap_long=0.4,
         tail_min_child=8,
@@ -218,7 +221,8 @@ MI2 = SiteProfile(
     expected_tariff="C1",
     expected_solar_kwp=780.0,
     expected_roof_area_m2=1200.0,
-    predictor=PredictorParams(n_estimators=200, bias_window=18),
+    predictor=PredictorParams(n_estimators=300, bias_window=18,
+                                tail_min_child=10, body_min_child=18),
     battery_kwh=250.0,
     loads=_default_loads(),
     data_hint="4. Load Profile (With Solar) Mi2.xlsx",
@@ -235,7 +239,7 @@ CUSTOM = SiteProfile(
     expected_tariff="C1",
     expected_solar_kwp=None,
     expected_roof_area_m2=800.0,
-    predictor=PredictorParams(),                  # all defaults
+    predictor=PredictorParams(n_estimators=300),  # bumped from 200
     loads=_default_loads(),
     data_hint="Any TNB-format Excel or CSV load profile.",
 )

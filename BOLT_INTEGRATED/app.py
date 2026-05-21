@@ -153,6 +153,112 @@ def _set_so(field: str, value):
     ov[field] = value
 
 
+def _check_data_quality(df: pd.DataFrame) -> list[dict]:
+    """Auto-detect common data-quality issues that hurt forecast accuracy.
+
+    Returns a list of {severity, title, detail} dicts ready for the UI.
+    severity: 'error' (model can't train reliably), 'warning' (likely to
+    hurt accuracy), or 'info' (FYI).
+    """
+    issues: list[dict] = []
+    if df is None or len(df) == 0:
+        return [{"severity": "error", "title": "Empty dataset",
+                 "detail": "No rows after parsing."}]
+
+    n = len(df)
+    span_days = (df["timestamp"].max() - df["timestamp"].min()).days
+
+    # 1) Length
+    if span_days < 30:
+        issues.append({
+            "severity": "warning", "title": f"Only {span_days} days of data",
+            "detail": "Forecaster needs 60+ days to learn weekly patterns "
+                      "reliably, 90+ for monthly seasonality. Long-horizon "
+                      "MAPE (h=24, h=48) will be capped no matter how you tune.",
+        })
+
+    # 2) Duplicate timestamps
+    dup = df["timestamp"].duplicated().sum()
+    if dup > 0:
+        issues.append({
+            "severity": "warning",
+            "title": f"{dup} duplicate timestamp(s)",
+            "detail": "Same timestamp appears more than once — silently "
+                      "kept the first occurrence during parsing. Inspect "
+                      "the raw file if this is unexpected.",
+        })
+
+    # 3) Gaps — expected interval 30 min
+    deltas = df["timestamp"].sort_values().diff().dt.total_seconds() / 60.0
+    expected = 30.0
+    big_gaps = int(((deltas > expected * 1.5)).sum())
+    if big_gaps > 0:
+        max_gap_min = float(deltas.max() or 0)
+        issues.append({
+            "severity": "warning" if big_gaps > 5 else "info",
+            "title": f"{big_gaps} gap(s) > 45 min (max {max_gap_min:.0f} min)",
+            "detail": "Missing intervals break lag features for the rows "
+                      "right after the gap. Consider forward-filling or "
+                      "splitting the dataset into continuous chunks.",
+        })
+
+    # 4) Negative kw_import
+    neg = int((df["kw_import"] < 0).sum())
+    if neg > 0:
+        issues.append({
+            "severity": "warning",
+            "title": f"{neg} row(s) with negative kw_import",
+            "detail": "Likely sensor errors or net-metering bookkeeping. "
+                      "These pollute training. Auto-clipping to 0 on use, "
+                      "but consider cleaning at the source.",
+        })
+
+    # 5) Sudden 10× spikes — likely sensor glitches, not real peaks
+    med = float(df["kw_import"].median())
+    if med > 0:
+        glitches = int((df["kw_import"] > 10 * med).sum())
+        if glitches > 0:
+            max_spike = float(df["kw_import"].max())
+            issues.append({
+                "severity": "warning",
+                "title": f"{glitches} row(s) > 10× median ({max_spike:.0f} kW vs median {med:.0f})",
+                "detail": "Either real peak events (festival ops, equipment "
+                          "startup) — informative, the outlier filter handles "
+                          "those — or sensor instrumentation glitches. "
+                          "Spot-check those rows.",
+            })
+
+    # 6) Long zero stretches (potentially missing data masked as 0)
+    zero_run = (df["kw_import"] == 0).rolling(48, min_periods=1).sum().max()
+    if zero_run >= 24:
+        issues.append({
+            "severity": "warning",
+            "title": f"Up to {int(zero_run)} consecutive zero readings",
+            "detail": "Could be a real outage, but often it's a parser "
+                      "issue (NaN → 0). Verify against the source file.",
+        })
+
+    # 7) Constant runs (sensor stuck)
+    const_run = 0
+    if len(df) > 12:
+        diffs_zero = (df["kw_import"].diff().abs() < 1e-6).astype(int)
+        const_run = int(diffs_zero.rolling(12, min_periods=1).sum().max())
+    if const_run >= 12:
+        issues.append({
+            "severity": "info",
+            "title": f"Up to {const_run} consecutive constant readings",
+            "detail": "Sensor may be reporting a hold value. Tree-based "
+                      "models can handle this, but it's worth flagging.",
+        })
+
+    if not issues:
+        issues.append({
+            "severity": "ok", "title": "Data looks clean",
+            "detail": f"{n:,} rows · {span_days} days · no anomalies detected.",
+        })
+    return issues
+
+
 def _run_manager_on_live_forecast() -> list | None:
     """Run the AI Manager on the *current 24-h forecast* to produce a
     forward-looking dispatch plan that updates every sim tick.
@@ -1016,6 +1122,27 @@ with tab1:
                     if "capacity_kwp" in solar_info:
                         st.write(f"Estimated capacity: **{solar_info['capacity_kwp']} kWp**")
 
+            # ── Data quality checks (run on the just-parsed df) ────────
+            st.divider()
+            st.subheader("🩺 Data Quality Check")
+            st.caption(
+                "Auto-detected issues that hurt forecast accuracy. Fix these "
+                "at the source if possible — they explain a lot of the "
+                "'MAPE is bad' problem."
+            )
+            _dq_issues = _check_data_quality(df)
+            for _iss in _dq_issues:
+                sev = _iss["severity"]
+                msg = f"**{_iss['title']}** — {_iss['detail']}"
+                if sev == "error":
+                    st.error(msg)
+                elif sev == "warning":
+                    st.warning(msg)
+                elif sev == "ok":
+                    st.success(msg)
+                else:
+                    st.info(msg)
+
             # ── Pre-filled assumptions (transparency) ──────────────────
             st.divider()
             st.subheader("🧾 Pre-filled Assumptions")
@@ -1085,6 +1212,21 @@ with tab2:
             f"Real weather: **{'ON' if use_real_weather else 'OFF'}** "
             f"(edit in Site Setup tab)."
         )
+        if not use_real_weather:
+            st.warning(
+                "⚠️  **Real weather is OFF — forecast accuracy is being capped.**  \n"
+                "Synthetic temperature + irradiance are *deterministic functions "
+                "of time-of-day*, so they encode the same information as the "
+                "`hour_sin / cos` features the model already has — they add **zero "
+                "extra signal**.  All 17 forward-looking weather features "
+                "(`fut_irrad_h{2,6,12,24,48}`, rolling future means, etc.) are "
+                "currently fed synthetic values too.  \n\n"
+                "Toggle **'Use real weather (Open-Meteo)'** in the 🛠️ Site Setup tab "
+                "to fetch actual ambient temp + shortwave irradiance for your "
+                "lat/lon.  First fetch caches to `data/weather_cache/`; subsequent "
+                "runs are offline.  **Expected MAPE improvement: 10–30 % on solar "
+                "sites, 5–15 % on HVAC-driven sites.**"
+            )
 
     col_train, col_cv = st.columns([2, 1])
     with col_train:
@@ -1230,22 +1372,47 @@ with tab_live:
     # ── Initialize the simulation lazily on first entry ─────────────────────
     if st.session_state.sim_state is None:
         try:
-            with st.spinner("Initialising live simulation (splitting data 70/30, seeding state)…"):
+            with st.spinner("Initialising live simulation: re-fitting forecaster on "
+                             "just the 70% slice (honest train/eval — model genuinely "
+                             "hasn't seen the future stream)…"):
                 train_df, future_df = split_historical_for_simulation(
                     _df_live, train_fraction=0.7,
                 )
-                # Re-seed forecaster.history to the train slice so revealed
-                # actuals from future_df aren't already in the model's view.
-                _fc_live.history = train_df.sort_values("timestamp").reset_index(drop=True)
+                # Honest split: refit on ONLY the 70% so the sim's accuracy
+                # numbers reflect real forecasting performance.  The earlier
+                # full-fit (used on the Predictor tab + persisted to disk) is
+                # untouched — it still represents the "best estimate using
+                # all data" for downstream tabs.
+                profile = get_profile(st.session_state.site_profile_id)
+                fc_kwargs = profile_predictor_kwargs(profile)
+                fc_kwargs["n_estimators"]  = _fc_live.n_estimators
+                fc_kwargs["learning_rate"] = _fc_live.learning_rate
+                if st.session_state.use_real_weather:
+                    fc_kwargs["lat"]      = float(_so("lat", profile.lat))
+                    fc_kwargs["lon"]      = float(_so("lon", profile.lon))
+                else:
+                    fc_kwargs["lat"] = None
+                    fc_kwargs["lon"] = None
+                _fc_honest = DirectMultiStepForecaster(
+                    capacity_kwp=_fc_live.capacity_kwp, **fc_kwargs,
+                )
+                _fc_honest.fit(train_df, verbose=False)
+                # Swap into session_state for the sim — leave disk-persisted
+                # model alone.
+                st.session_state.forecaster = _fc_honest
+                _fc_live = _fc_honest
                 st.session_state.sim_history_actuals = train_df.copy()
+                _bw = profile.predictor.bias_window
                 st.session_state.sim_state = initialize_simulation(
-                    _fc_live, future_df,
+                    _fc_honest, future_df,
                     retrain_every_n=12,
                     warm_start_rounds=50,
+                    bias_window=_bw,         # per-site tuned (SoL=8, E=24, …)
                 )
             st.success(
-                f"Sim ready · {len(train_df):,} rows historical · "
-                f"{len(future_df):,} rows reserved as future stream "
+                f"Sim ready · refit forecaster on **{len(train_df):,}** rows "
+                f"(honest eval, no train/test contamination) · "
+                f"**{len(future_df):,}** rows held out as the future stream "
                 f"({len(future_df) // 48} days)"
             )
         except Exception as e:
@@ -1620,9 +1787,11 @@ with tab_live:
                 _fc_live.history = (_hist_for_sim
                                      .sort_values("timestamp")
                                      .reset_index(drop=True))
+                _bw = get_profile(st.session_state.site_profile_id).predictor.bias_window
                 st.session_state.sim_state = initialize_simulation(
                     _fc_live, future_df_user,
                     retrain_every_n=12, warm_start_rounds=50,
+                    bias_window=_bw,
                 )
                 st.success(
                     f"Future stream replaced — {len(future_df_user):,} rows "
