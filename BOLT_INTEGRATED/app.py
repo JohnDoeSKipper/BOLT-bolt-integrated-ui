@@ -33,7 +33,7 @@ from calculator.tnb_tariffs import (
 
 from powerreco.solar_sizing import calculate_solar_sizing
 from powerreco.battery_sizing import calculate_battery_sizing
-from powerreco.roi_engine import calculate_roi
+from powerreco.roi_engine import calculate_roi, assess_feasibility
 from powerreco.optimizer import find_optimum_from_existing_run
 from powerreco.energy_flows import decompose_flows, representative_day
 
@@ -102,6 +102,9 @@ for key, default in [
     # tick's first-interval decision.  Without this the Manager re-plans
     # from a fresh 50 % every tick, ignoring battery state evolution.
     ("live_battery_soc_pct", None),
+    # Accumulates the FIRST row of each tick's Manager output — the decision
+    # actually executed on the live actual reading, not the forecast plan.
+    ("executed_ticks", []),
     # Per-site override dict: {site_id: {field: user_value}}.  Any field not
     # in here falls back to the site profile preset.  Editing in the Site
     # Setup tab populates these; switching site profile in the sidebar
@@ -1539,6 +1542,7 @@ with tab_live:
         st.session_state.live_battery_soc_pct  = None
         st.session_state.live_manager_results  = None
         st.session_state.live_manager_last_tick = -1
+        st.session_state.executed_ticks         = []
         st.rerun()
 
     sp1, sp2 = st.columns([3, 2])
@@ -1587,6 +1591,17 @@ with tab_live:
                 if _lm is not None and len(_lm) > 0:
                     st.session_state.live_manager_results = _lm
                     st.session_state.live_manager_last_tick = sim.tick
+                    # ── Accumulate executed decisions ──────────────────────
+                    # The first row of the Manager output is always the actual
+                    # reading (prepended in _run_manager_on_live_forecast).
+                    # Save it as the "executed" decision for this tick so the
+                    # Manager tab can show history vs forward plan separately.
+                    if len(_lm) > 0:
+                        _exec = st.session_state.get("executed_ticks", [])
+                        _new_ts = _lm[0].get("timestamp")
+                        if not _exec or _exec[-1].get("timestamp") != _new_ts:
+                            _exec.append(dict(_lm[0]))
+                            st.session_state.executed_ticks = _exec
                     # ── #2 SOC CONTINUITY ──────────────────────────────────
                     # Save the SOC AFTER the first interval (which is the
                     # decision we're "executing" this tick) so the next
@@ -1918,7 +1933,7 @@ with tab3:
 
     @st.fragment(run_every=f"{_mgr_tick_rate:.1f}s")
     def _live_manager_view():
-        # Make sure we have a Manager plan to draw — try once if missing.
+        # Ensure a plan exists — try once if missing (sim just initialised).
         results = st.session_state.get("live_manager_results")
         if results is None or len(results) == 0:
             _maybe = _run_manager_on_live_forecast()
@@ -1931,221 +1946,345 @@ with tab3:
                 "Live strategy will appear once you (1) train a forecaster, "
                 "(2) open the **🔴 Live Simulation** tab to initialise the sim, "
                 "and (3) hit Play.  Every tick the Manager re-optimises "
-                "against the fresh forecast — KPIs and charts below update "
-                "automatically."
+                "against the fresh forecast."
             )
             return
 
-        sim = st.session_state.get("sim_state")
+        sim            = st.session_state.get("sim_state")
+        executed_ticks = st.session_state.get("executed_ticks", [])
+        palette        = ["#00b4d8", "#f59e0b", "#a78bfa", "#22c55e", "#f97316", "#ec4899"]
+
+        # ══════════════════════════════════════════════════════════════════
+        # SECTION 1 — THIS TICK: what the Manager actually did right now
+        # ══════════════════════════════════════════════════════════════════
+        st.markdown("### ⚡ This Tick — What the Manager just did")
+        st.caption(
+            "The first interval of each Manager run is grounded in the latest "
+            "**revealed actual** reading, not a forecast.  This section shows "
+            "the decision the Manager took on that real reading."
+        )
+
+        if executed_ticks:
+            cur    = executed_ticks[-1]
+            cur_ts = pd.to_datetime(cur["timestamp"]).strftime("%Y-%m-%d %H:%M")
+            st.caption(f"Executed at **{cur_ts}**")
+
+            # KPIs
+            k1, k2, k3, k4, k5 = st.columns(5)
+            kva_orig = float(cur.get("kva_original", 0))
+            kva_mgd  = float(cur.get("kva_managed",  0))
+            delta_kva = kva_mgd - kva_orig
+            k1.metric("Actual kVA",   f"{kva_orig:.1f}")
+            k2.metric("Managed kVA",  f"{kva_mgd:.1f}",
+                      delta=f"{delta_kva:+.1f}", delta_color="inverse")
+            bat_act = float(cur.get("battery_action_kw", 0))
+            bat_soc = float(cur.get("battery_soc_pct", 0))
+            if bat_act < -0.1:
+                k3.metric("Battery", f"Discharge {-bat_act:.1f} kW",
+                          delta=f"SOC {bat_soc:.0f}%", delta_color="inverse")
+            elif bat_act > 0.1:
+                k3.metric("Battery", f"Charge {bat_act:.1f} kW",
+                          delta=f"SOC {bat_soc:.0f}%")
+            else:
+                k3.metric("Battery", "Idle", delta=f"SOC {bat_soc:.0f}%", delta_color="off")
+            k4.metric("MD Window",   "🔴 Active" if cur.get("in_md_hours")  else "⬜ Off-peak")
+            k5.metric("Pre-MD Boost","🟡 Active" if cur.get("in_pre_md")    else "—")
+
+            # Per-load conditions
+            load_factor_keys = [
+                c for c in cur.keys()
+                if c.endswith("_factor")
+                and c not in ("load_factor",)
+                and not c.startswith(("kw_", "kvar_", "kva_", "bat"))
+            ]
+            if load_factor_keys:
+                st.markdown("**Load conditions this tick:**")
+                lcols = st.columns(len(load_factor_keys))
+                for i, fk in enumerate(load_factor_keys):
+                    lk       = fk.replace("_factor", "")
+                    factor   = float(cur.get(fk, 1.0))
+                    load_kva = float(cur.get(f"{lk}_kva",     0))
+                    mgd_kva  = float(cur.get(f"{lk}_managed", 0))
+                    cut_pct  = (1 - factor) * 100
+                    color    = "#ef4444" if cut_pct > 1 else "#22c55e"
+                    status   = f"Shed {cut_pct:.0f}%" if cut_pct > 0.5 else "Normal"
+                    with lcols[i]:
+                        st.markdown(
+                            f"**{lk.replace('_',' ').title()}**  \n"
+                            f"<span style='color:{color}'>{status}</span>  \n"
+                            f"{mgd_kva:.1f} / {load_kva:.1f} kVA",
+                            unsafe_allow_html=True,
+                        )
+
+            # Actions taken this tick
+            actions_now = cur.get("actions", [])
+            if actions_now:
+                st.markdown("**Actions taken:**")
+                for a in actions_now:
+                    kind = a.get("type", "?")
+                    if kind == "battery_discharge":
+                        st.success(
+                            f"🔻 **Discharged** {a.get('discharge_kw', 0):.1f} kW  "
+                            f"· SOC {a.get('soc_before_kwh', 0):.0f} → "
+                            f"{a.get('soc_after_kwh', 0):.0f} kWh"
+                            + ("  · look-ahead trigger" if a.get("lookahead_triggered") else "")
+                            + ("  · in MD window"        if a.get("md_hours")            else "")
+                        )
+                    elif kind == "battery_charge":
+                        st.info(
+                            f"🔺 **Charged** {a.get('charge_kw', 0):.1f} kW  "
+                            f"· {a.get('charge_trigger', '')}  "
+                            f"· SOC {a.get('soc_before_kwh', 0):.0f} → "
+                            f"{a.get('soc_after_kwh', 0):.0f} kWh"
+                        )
+                    elif kind == "load_reduction":
+                        st.warning(
+                            f"✂️ **Cut** {a.get('cut_kva', 0):.1f} kVA  "
+                            f"from **{a.get('load', '?')}**  "
+                            f"({a.get('reason', 'normal')})  "
+                            f"→ factor {a.get('factor_pct', 0):.0f}% remaining"
+                        )
+            else:
+                st.caption("No interventions needed — load was within the discharge trigger.")
+        else:
+            st.info("Advance the simulation to see per-tick decisions here.")
+
+        st.divider()
+
+        # ══════════════════════════════════════════════════════════════════
+        # SECTION 2 — HISTORY: accumulated executed decisions
+        # ══════════════════════════════════════════════════════════════════
+        st.markdown("### 📜 History — What has happened")
+        st.caption(
+            "Every tick the Manager executed an actual reading.  "
+            "This chart and log accumulate those real decisions — not the forecast plan."
+        )
+
+        if len(executed_ticks) > 1:
+            hist_df = pd.DataFrame([
+                {k: v for k, v in t.items() if k != "actions"} for t in executed_ticks
+            ])
+            hist_df["timestamp"] = pd.to_datetime(hist_df["timestamp"])
+
+            # Summary KPIs
+            h1, h2, h3, h4 = st.columns(4)
+            n_dis       = sum(1 for t in executed_ticks if float(t.get("battery_discharge_kw", 0)) > 0.1)
+            n_chg       = sum(1 for t in executed_ticks if float(t.get("battery_charge_kw",    0)) > 0.1)
+            n_cuts      = sum(
+                len([a for a in t.get("actions", []) if a.get("type") == "load_reduction"])
+                for t in executed_ticks
+            )
+            tot_dis_kwh = sum(float(t.get("battery_discharge_kw", 0)) * 0.5 for t in executed_ticks)
+            h1.metric("Ticks executed",    len(executed_ticks))
+            h2.metric("Discharge events",  n_dis, delta=f"{tot_dis_kwh:.1f} kWh total")
+            h3.metric("Charge events",     n_chg)
+            h4.metric("Load cuts applied", n_cuts)
+
+            # History chart: actual vs managed kVA + SOC overlay
+            fig_hist = make_subplots(
+                rows=2, cols=1, shared_xaxes=True,
+                vertical_spacing=0.06, row_heights=[0.65, 0.35],
+                subplot_titles=("Actual vs managed kVA (executed)", "Battery SOC % (executed)"),
+            )
+            fig_hist.add_trace(go.Scatter(
+                x=hist_df["timestamp"], y=hist_df["kva_original"],
+                mode="lines+markers", name="Actual kVA",
+                line=dict(color="#ef4444", width=2), marker=dict(size=3),
+            ), row=1, col=1)
+            fig_hist.add_trace(go.Scatter(
+                x=hist_df["timestamp"], y=hist_df["kva_managed"],
+                mode="lines+markers", name="Managed kVA",
+                line=dict(color="#00d4ff", width=2.5), marker=dict(size=3),
+            ), row=1, col=1)
+            if "target_peak" in hist_df.columns:
+                fig_hist.add_trace(go.Scatter(
+                    x=hist_df["timestamp"], y=hist_df["target_peak"],
+                    mode="lines", name="Target",
+                    line=dict(color="#22c55e", width=1.5, dash="dash"),
+                ), row=1, col=1)
+            fig_hist.add_trace(go.Scatter(
+                x=hist_df["timestamp"], y=hist_df.get("battery_soc_pct", pd.Series(dtype=float)),
+                mode="lines+markers", name="SOC %",
+                line=dict(color="#a78bfa", width=2),
+                fill="tozeroy", fillcolor="rgba(167,139,250,0.15)",
+                marker=dict(size=3),
+            ), row=2, col=1)
+            fig_hist.update_layout(
+                height=420, hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.04),
+            )
+            fig_hist.update_yaxes(title_text="kVA",  row=1, col=1)
+            fig_hist.update_yaxes(title_text="SOC %", row=2, col=1, range=[0, 105])
+            fig_hist.update_xaxes(title_text="Time",  row=2, col=1)
+            st.plotly_chart(fig_hist, use_container_width=True,
+                            key=f"hist_chart_{len(executed_ticks)}")
+
+            # Executed action log
+            with st.expander(f"Executed action log — {len(executed_ticks)} ticks"):
+                elog: list[dict] = []
+                for t in reversed(executed_ticks[-60:]):
+                    ts_lbl = pd.to_datetime(t["timestamp"]).strftime("%Y-%m-%d %H:%M")
+                    for a in t.get("actions", []):
+                        kind = a.get("type", "?")
+                        if kind == "battery_discharge":
+                            elog.append({"Time": ts_lbl, "": "🔻", "Action": "Discharge",
+                                          "Load": "Battery",
+                                          "Detail": (
+                                              f"{a.get('discharge_kw', 0):.1f} kW · "
+                                              f"SOC {a.get('soc_before_kwh', 0):.0f}→"
+                                              f"{a.get('soc_after_kwh', 0):.0f} kWh"
+                                              + (" · look-ahead" if a.get("lookahead_triggered") else "")
+                                              + (" · MD-hrs"     if a.get("md_hours")            else "")
+                                          )})
+                        elif kind == "battery_charge":
+                            elog.append({"Time": ts_lbl, "": "🔺", "Action": "Charge",
+                                          "Load": "Battery",
+                                          "Detail": (
+                                              f"{a.get('charge_kw', 0):.1f} kW · "
+                                              f"{a.get('charge_trigger', '')} · "
+                                              f"SOC {a.get('soc_before_kwh', 0):.0f}→"
+                                              f"{a.get('soc_after_kwh', 0):.0f} kWh"
+                                          )})
+                        elif kind == "load_reduction":
+                            elog.append({"Time": ts_lbl, "": "✂️", "Action": "Load cut",
+                                          "Load": a.get("load", "?"),
+                                          "Detail": (
+                                              f"Cut {a.get('cut_kva', 0):.1f} kVA · "
+                                              f"{a.get('reason', 'normal')} · "
+                                              f"factor {a.get('factor_pct', 0):.0f}%"
+                                          )})
+                if elog:
+                    st.dataframe(pd.DataFrame(elog), use_container_width=True,
+                                 hide_index=True, height=240)
+                else:
+                    st.caption("No interventions in executed history.")
+        else:
+            st.caption("History populates as the simulation advances tick by tick.")
+
+        st.divider()
+
+        # ══════════════════════════════════════════════════════════════════
+        # SECTION 3 — FORWARD PLAN: what the Manager intends to do
+        # The forward plan is based on the 24-h forecast — it updates every
+        # tick as new actuals arrive.  It is a PLAN, not executed history.
+        # The first interval (index 0) is the actual reading already shown
+        # above; we skip it and show only the future-facing intervals.
+        # ══════════════════════════════════════════════════════════════════
+        future_results = results[1:] if len(results) > 1 else results
         sim_label = (
             f"sim tick {sim.tick:,}/{sim.total_ticks:,}" if sim is not None else "static plan"
         )
         st.markdown(
-            f"##### 🔴 Live Forward Strategy "
-            f"<span style='color:#9ca3af;font-weight:400;font-size:13px'>"
-            f"({len(results)} forecast intervals · {sim_label})</span>",
+            f"### 🗺️ Forward Plan — Manager's intent  "
+            f"<span style='color:#9ca3af;font-size:13px;font-weight:400'>"
+            f"({len(future_results)} intervals · {sim_label})</span>",
             unsafe_allow_html=True,
         )
         st.caption(
-            "The Manager re-optimises against the latest 24-h forecast on every "
-            "sim tick.  Lines = forecast / target / managed peak.  Stacked bars = "
-            "per-load kVA after dispatch.  Battery action shown below.  "
-            "Action log at the bottom lists every discharge, charge, and "
-            "load-trim decision in the current plan."
+            "Based on the **current 24-h forecast**.  Updates every tick as new actuals "
+            "arrive and refine the forecast.  This is a living plan — reality may diverge, "
+            "at which point the next tick will revise it."
         )
 
-        # ── Build flat result df ────────────────────────────────────────
-        res_df = pd.DataFrame([
-            {k: v for k, v in r.items() if k != "actions"} for r in results
-        ])
-        res_df["timestamp"] = pd.to_datetime(res_df["timestamp"])
+        if future_results:
+            fut_df = pd.DataFrame([
+                {k: v for k, v in r.items() if k != "actions"} for r in future_results
+            ])
+            fut_df["timestamp"] = pd.to_datetime(fut_df["timestamp"])
 
-        # ── General KPIs ────────────────────────────────────────────────
-        forecast_peak = float(res_df["kva_original"].max())
-        managed_peak  = float(res_df["kva_managed"].max())
-        peak_red_pct  = (
-            (forecast_peak - managed_peak) / forecast_peak * 100
-            if forecast_peak > 0 else 0.0
-        )
-        bat_dis_kwh   = float(res_df["battery_discharge_kw"].sum()) * 0.5
-        # MD reduction uses kW rather than kVA since TNB MD bills on kW
-        kw_orig_peak   = float(res_df["kw_original"].max()) if "kw_original" in res_df.columns else forecast_peak
-        kw_managed_peak = float(res_df["kw_managed"].max())  if "kw_managed"  in res_df.columns else managed_peak
-        md_red_pct = (
-            (kw_orig_peak - kw_managed_peak) / kw_orig_peak * 100
-            if kw_orig_peak > 0 else 0.0
-        )
+            # Plan KPIs
+            fc_peak  = float(fut_df["kva_original"].max()) if "kva_original" in fut_df.columns else 0
+            pln_peak = float(fut_df["kva_managed"].max())  if "kva_managed"  in fut_df.columns else 0
+            pk_red   = (fc_peak - pln_peak) / fc_peak * 100 if fc_peak > 0 else 0
+            pln_dis  = float(fut_df.get("battery_discharge_kw", pd.Series([0])).sum()) * 0.5
+            cur_soc  = float(executed_ticks[-1].get("battery_soc_pct", 50)) if executed_ticks else 50.0
 
-        k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Forecast peak",    f"{forecast_peak:,.0f} kVA")
-        k2.metric("Managed peak",     f"{managed_peak:,.0f} kVA",
-                   delta=f"−{peak_red_pct:.1f}%", delta_color="inverse")
-        k3.metric("Peak reduction",   f"{peak_red_pct:.1f}%")
-        k4.metric("Battery discharged", f"{bat_dis_kwh:,.1f} kWh")
-        k5.metric("MD reduction (kW)", f"{md_red_pct:.1f}%")
+            pk1, pk2, pk3, pk4 = st.columns(4)
+            pk1.metric("Forecast peak (plan)",   f"{fc_peak:.1f} kVA")
+            pk2.metric("Planned managed peak",   f"{pln_peak:.1f} kVA",
+                       delta=f"−{pk_red:.1f}%", delta_color="inverse")
+            pk3.metric("Planned discharge",      f"{pln_dis:.1f} kWh")
+            pk4.metric("Current SOC",            f"{cur_soc:.0f}%")
 
-        # ── Load Optimize Graph (2 sub-rows) ────────────────────────────
-        from plotly.subplots import make_subplots
-        st.markdown("##### 📊 Load Optimize")
-        load_keys = [
-            c.replace("_managed", "")
-            for c in res_df.columns
-            if c.endswith("_managed")
-            and c not in ("kw_managed", "kvar_managed", "kva_managed")
-        ]
-        palette = ["#00b4d8", "#f59e0b", "#a78bfa",
-                    "#22c55e", "#f97316", "#ec4899"]
-
-        fig_lo = make_subplots(
-            rows=2, cols=1, shared_xaxes=True,
-            vertical_spacing=0.06, row_heights=[0.66, 0.34],
-            subplot_titles=("Load profile (kVA)", "Battery action (kW, +charge / −discharge)"),
-        )
-        # Stacked per-load kVA bars first so the lines render on top
-        for i, lk in enumerate(load_keys):
-            col = f"{lk}_managed"
-            if col in res_df.columns:
-                fig_lo.add_trace(go.Bar(
-                    x=res_df["timestamp"], y=res_df[col],
-                    name=f"{lk} (managed)",
-                    marker_color=palette[i % len(palette)],
-                    opacity=0.55,
-                ), row=1, col=1)
-        # Lines: forecast peak (original), target peak, managed peak
-        fig_lo.add_trace(go.Scatter(
-            x=res_df["timestamp"], y=res_df["kva_original"],
-            mode="lines", name="Forecast peak (kVA)",
-            line=dict(color="#ef4444", width=2.5),
-        ), row=1, col=1)
-        if "target_peak" in res_df.columns:
-            fig_lo.add_trace(go.Scatter(
-                x=res_df["timestamp"], y=res_df["target_peak"],
-                mode="lines", name="Target peak",
-                line=dict(color="#22c55e", width=2, dash="dash"),
-            ), row=1, col=1)
-        fig_lo.add_trace(go.Scatter(
-            x=res_df["timestamp"], y=res_df["kva_managed"],
-            mode="lines", name="Managed peak (kVA)",
-            line=dict(color="#00d4ff", width=2.5),
-        ), row=1, col=1)
-        # Battery action: charge positive, discharge negative
-        fig_lo.add_trace(go.Bar(
-            x=res_df["timestamp"], y=res_df["battery_charge_kw"],
-            name="Battery charge",
-            marker_color="#22c55e",
-        ), row=2, col=1)
-        fig_lo.add_trace(go.Bar(
-            x=res_df["timestamp"], y=-res_df["battery_discharge_kw"],
-            name="Battery discharge",
-            marker_color="#ef4444",
-        ), row=2, col=1)
-        fig_lo.update_layout(
-            height=520, barmode="stack",
-            hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.06,
-                         xanchor="left", x=0),
-        )
-        fig_lo.update_xaxes(title_text="Time",   row=2, col=1)
-        fig_lo.update_yaxes(title_text="kVA",    row=1, col=1)
-        fig_lo.update_yaxes(title_text="kW",     row=2, col=1)
-        st.plotly_chart(
-            fig_lo, use_container_width=True,
-            key=f"mgr_lo_{len(results)}_{st.session_state.live_manager_last_tick}",
-        )
-
-        # ── Battery panel ───────────────────────────────────────────────
-        st.markdown("##### 🔋 Battery")
-        fig_bat = make_subplots(
-            rows=2, cols=1, shared_xaxes=True,
-            vertical_spacing=0.06, row_heights=[0.55, 0.45],
-            subplot_titles=("State of charge (%)", "Charging / discharging (kW)"),
-        )
-        fig_bat.add_trace(go.Scatter(
-            x=res_df["timestamp"], y=res_df["battery_soc_pct"],
-            mode="lines", name="SOC %",
-            line=dict(color="#a78bfa", width=2.5),
-            fill="tozeroy", fillcolor="rgba(167,139,250,0.18)",
-        ), row=1, col=1)
-        fig_bat.add_trace(go.Bar(
-            x=res_df["timestamp"], y=res_df["battery_charge_kw"],
-            name="Charge",  marker_color="#22c55e",
-        ), row=2, col=1)
-        fig_bat.add_trace(go.Bar(
-            x=res_df["timestamp"], y=-res_df["battery_discharge_kw"],
-            name="Discharge", marker_color="#ef4444",
-        ), row=2, col=1)
-        fig_bat.update_layout(
-            height=400, hovermode="x unified",
-            legend=dict(orientation="h", yanchor="bottom", y=1.05),
-        )
-        fig_bat.update_xaxes(title_text="Time", row=2, col=1)
-        fig_bat.update_yaxes(title_text="SOC %", row=1, col=1, range=[0, 100])
-        fig_bat.update_yaxes(title_text="kW",    row=2, col=1)
-        st.plotly_chart(
-            fig_bat, use_container_width=True,
-            key=f"mgr_bat_{len(results)}_{st.session_state.live_manager_last_tick}",
-        )
-
-        # ── Action log ─────────────────────────────────────────────────
-        st.markdown("##### 📜 Action Log")
-        log_rows: list[dict] = []
-        for r in results:
-            ts_label = pd.to_datetime(r["timestamp"]).strftime("%Y-%m-%d %H:%M")
-            for a in r.get("actions", []):
-                kind = a.get("type", "?")
-                if kind == "battery_discharge":
-                    detail = (
-                        f"Discharge {a.get('discharge_kw', 0):.1f} kW · "
-                        f"SOC {a.get('soc_before_kwh', 0):.0f}→{a.get('soc_after_kwh', 0):.0f} kWh"
-                        + (" · look-ahead" if a.get("lookahead_triggered") else "")
-                        + (" · MD-hrs" if a.get("md_hours") else "")
-                    )
-                    icon = "🔻"
-                elif kind == "battery_charge":
-                    detail = (
-                        f"Charge {a.get('charge_kw', 0):.1f} kW · "
-                        f"{a.get('charge_trigger', '')} · "
-                        f"SOC {a.get('soc_before_kwh', 0):.0f}→{a.get('soc_after_kwh', 0):.0f} kWh"
-                    )
-                    icon = "🔺"
-                elif kind == "load_reduction":
-                    detail = (
-                        f"Cut {a.get('cut_kva', 0):.1f} kVA "
-                        f"from {a.get('load', '?')} "
-                        f"(reason: {a.get('reason', 'normal')}, "
-                        f"factor {a.get('factor_pct', 0):.0f}%)"
-                    )
-                    icon = "✂️"
-                else:
-                    detail = str(a)
-                    icon   = "•"
-                log_rows.append({
-                    "Time":    ts_label,
-                    "":        icon,
-                    "Action":  kind.replace("_", " "),
-                    "Load":    a.get("load", "—"),
-                    "Detail":  detail,
-                })
-
-        if log_rows:
-            # Most recent first, capped at 50 to keep the table fast
-            log_df = pd.DataFrame(log_rows[::-1][:50])
-            st.dataframe(log_df, use_container_width=True, hide_index=True, height=300)
-            st.caption(f"{len(log_rows)} total actions across the 24-h plan · showing latest 50.")
-        else:
-            st.caption(
-                "No actions in the current forecast horizon — load stays below "
-                "the discharge trigger, and the battery sits idle.  "
-                "Lower the **MD target %** in Site Setup to make the strategy "
-                "more aggressive."
+            # Forward load + battery chart
+            fwd_load_keys = [
+                c.replace("_managed", "")
+                for c in fut_df.columns
+                if c.endswith("_managed")
+                and c not in ("kw_managed", "kvar_managed", "kva_managed")
+            ]
+            fig_fwd = make_subplots(
+                rows=2, cols=1, shared_xaxes=True,
+                vertical_spacing=0.06, row_heights=[0.65, 0.35],
+                subplot_titles=("Planned load (kVA)", "Planned battery action (kW)"),
             )
+            for i, lk in enumerate(fwd_load_keys):
+                col_name = f"{lk}_managed"
+                if col_name in fut_df.columns:
+                    fig_fwd.add_trace(go.Bar(
+                        x=fut_df["timestamp"], y=fut_df[col_name],
+                        name=f"{lk} (planned)",
+                        marker_color=palette[i % len(palette)], opacity=0.55,
+                    ), row=1, col=1)
+            fig_fwd.add_trace(go.Scatter(
+                x=fut_df["timestamp"], y=fut_df["kva_original"],
+                mode="lines", name="Forecast kVA",
+                line=dict(color="#ef4444", width=2.5),
+            ), row=1, col=1)
+            if "target_peak" in fut_df.columns:
+                fig_fwd.add_trace(go.Scatter(
+                    x=fut_df["timestamp"], y=fut_df["target_peak"],
+                    mode="lines", name="Target",
+                    line=dict(color="#22c55e", width=2, dash="dash"),
+                ), row=1, col=1)
+            fig_fwd.add_trace(go.Scatter(
+                x=fut_df["timestamp"], y=fut_df["kva_managed"],
+                mode="lines", name="Planned managed kVA",
+                line=dict(color="#00d4ff", width=2.5),
+            ), row=1, col=1)
+            if "battery_charge_kw" in fut_df.columns:
+                fig_fwd.add_trace(go.Bar(
+                    x=fut_df["timestamp"], y=fut_df["battery_charge_kw"],
+                    name="Charge (planned)", marker_color="#22c55e",
+                ), row=2, col=1)
+            if "battery_discharge_kw" in fut_df.columns:
+                fig_fwd.add_trace(go.Bar(
+                    x=fut_df["timestamp"], y=-fut_df["battery_discharge_kw"],
+                    name="Discharge (planned)", marker_color="#ef4444",
+                ), row=2, col=1)
+            fig_fwd.update_layout(
+                height=500, barmode="stack", hovermode="x unified",
+                legend=dict(orientation="h", yanchor="bottom", y=1.06, xanchor="left", x=0),
+            )
+            fig_fwd.update_xaxes(title_text="Time", row=2, col=1)
+            fig_fwd.update_yaxes(title_text="kVA",  row=1, col=1)
+            fig_fwd.update_yaxes(title_text="kW",   row=2, col=1)
+            st.plotly_chart(fig_fwd, use_container_width=True,
+                            key=f"mgr_fwd_{len(results)}_{st.session_state.live_manager_last_tick}")
 
-        # ── #3 FORECAST vs ACTUAL DIVERGENCE ─────────────────────────────
-        # When reality diverges from forecast, the previous tick's plan
-        # was wrong by exactly this amount.  Big spikes here = moments
-        # where the model missed and the Manager would have under-/over-
-        # reacted.  Helps the user reason about WHEN the live strategy
-        # was off.
+            # Planned action log
+            with st.expander("Planned action log — what the Manager intends to do"):
+                flog: list[dict] = []
+                for r in future_results:
+                    ts_lbl = pd.to_datetime(r["timestamp"]).strftime("%H:%M")
+                    for a in r.get("actions", []):
+                        kind = a.get("type", "?")
+                        if kind == "battery_discharge":
+                            flog.append({"Time": ts_lbl, "": "🔻", "Action": "Discharge",
+                                          "Detail": f"{a.get('discharge_kw', 0):.1f} kW · SOC {a.get('soc_before_kwh', 0):.0f}→{a.get('soc_after_kwh', 0):.0f} kWh"})
+                        elif kind == "battery_charge":
+                            flog.append({"Time": ts_lbl, "": "🔺", "Action": "Charge",
+                                          "Detail": f"{a.get('charge_kw', 0):.1f} kW · {a.get('charge_trigger', '')}"})
+                        elif kind == "load_reduction":
+                            flog.append({"Time": ts_lbl, "": "✂️", "Action": "Load cut",
+                                          "Detail": f"{a.get('load', '?')} · {a.get('cut_kva', 0):.1f} kVA · {a.get('reason', 'normal')}"})
+                if flog:
+                    st.dataframe(pd.DataFrame(flog), use_container_width=True,
+                                 hide_index=True, height=200)
+                else:
+                    st.caption("No planned interventions — forecast stays within the discharge trigger.")
+
+        # ── Forecast vs Actual Divergence ──────────────────────────────────
         sim_d = st.session_state.get("sim_state")
         if sim_d is not None and len(sim_d.forecast_log) > 0:
             verified = pd.DataFrame([
@@ -2153,37 +2292,28 @@ with tab3:
                 if r.get("actual") is not None and r.get("horizon_steps") == 1
             ])
             if len(verified) > 0:
+                st.divider()
                 st.markdown("##### 📉 Forecast vs Actual Divergence")
                 st.caption(
-                    "For every revealed actual, this is (actual − forecast that "
-                    "was made 30 min earlier).  Positive bars = the model "
-                    "underpredicted (under-reacted); negative = overpredicted "
-                    "(over-reacted).  The flatter the line, the more closely "
-                    "the Manager's plan tracked reality."
+                    "How much actual load deviated from the h=1 forecast each tick.  "
+                    "Positive bars = underpredicted (less buffer available than planned).  "
+                    "Negative = overpredicted (excess reserve held unnecessarily).  "
+                    "Flat line = Manager's plan tracked reality closely."
                 )
                 verified = verified.sort_values("target_ts").reset_index(drop=True)
                 verified["divergence_kw"] = verified["actual"] - verified["median"]
-                verified["abs_pct"] = (
-                    verified["divergence_kw"].abs()
-                    / verified["actual"].clip(lower=1.0) * 100
-                )
-                # KPIs
                 d1, d2, d3, d4 = st.columns(4)
-                d1.metric("Verified rows",        f"{len(verified):,}")
-                d2.metric("Mean |error|",         f"{verified['divergence_kw'].abs().mean():.1f} kW")
-                d3.metric("Max underpredict",     f"+{verified['divergence_kw'].max():.0f} kW")
-                d4.metric("Max overpredict",      f"{verified['divergence_kw'].min():.0f} kW")
-
-                # Coloured signed-error bars
+                d1.metric("Verified ticks",    f"{len(verified):,}")
+                d2.metric("Mean |error|",      f"{verified['divergence_kw'].abs().mean():.1f} kW")
+                d3.metric("Max underpredict",  f"+{verified['divergence_kw'].max():.0f} kW")
+                d4.metric("Max overpredict",   f"{verified['divergence_kw'].min():.0f} kW")
                 colors = ["#ef4444" if v > 0 else "#3b82f6" for v in verified["divergence_kw"]]
                 fig_dv = go.Figure()
                 fig_dv.add_trace(go.Bar(
                     x=verified["target_ts"], y=verified["divergence_kw"],
-                    marker_color=colors,
-                    name="actual − forecast",
+                    marker_color=colors, name="actual − forecast",
                     hovertemplate="%{x}<br>Δ %{y:.1f} kW<extra></extra>",
                 ))
-                # Reference line at 0
                 fig_dv.add_trace(go.Scatter(
                     x=[verified["target_ts"].min(), verified["target_ts"].max()],
                     y=[0, 0], mode="lines",
@@ -2191,11 +2321,10 @@ with tab3:
                 ))
                 fig_dv.update_layout(
                     xaxis_title="Time", yaxis_title="kW (actual − h=1 forecast)",
-                    height=320, showlegend=False,
-                    bargap=0.05,
+                    height=300, showlegend=False, bargap=0.05,
                 )
                 st.plotly_chart(fig_dv, use_container_width=True,
-                                 key=f"mgr_dv_{len(verified)}_{st.session_state.live_manager_last_tick}")
+                                key=f"mgr_dv_{len(verified)}_{st.session_state.live_manager_last_tick}")
 
     _live_manager_view()
 
@@ -2644,13 +2773,12 @@ with tab5:
                 solar = calculate_solar_sizing(roof_area, int(panel_w), psh)
                 st.session_state.solar_sizing = solar
 
-                # Battery sizing from Manager results if available
                 if st.session_state.powerreco_df is not None:
                     batt = calculate_battery_sizing(st.session_state.powerreco_df)
                     md_reduction_kw = batt["md_reduction_kw"]
                 else:
                     st.warning(
-                        "No Manager results — battery sized conservatively to 10% of daily solar. "
+                        "No Manager results — battery sized conservatively. "
                         "Run the AI Manager for a data-driven battery recommendation."
                     )
                     daily_kwh = solar["daily_generation_kwh_avg"]
@@ -2665,11 +2793,28 @@ with tab5:
 
                 battery_kwh_rec = float(batt["min_capacity_kwh_commercial"])
 
+                # Run feasibility check — determines if installation is worth it
+                _summ = st.session_state.file_summary or {}
+                _avg_monthly = float(_summ.get("mean_kw_import", 0)) * 24 * 30 / 2
+                _peak_kw     = float(_summ.get("max_kw_import",  0))
+                feasibility = assess_feasibility(
+                    avg_monthly_kwh=max(_avg_monthly, float(solar["monthly_generation_kwh_avg"])),
+                    peak_demand_kw=_peak_kw,
+                    tariff=st.session_state.tariff_code,
+                    md_reduction_kw=md_reduction_kw,
+                    schedule_key=sched_key,
+                    monthly_gen_kwh_per_kwp=float(solar["monthly_generation_kwh_avg"]) / max(solar["system_kwp"], 1),
+                    solar_cost_per_kwp=solar_cost,
+                    battery_cost_per_kwh=batt_cost,
+                    battery_kwh=battery_kwh_rec,
+                )
+                st.session_state["powerreco_feasibility"] = feasibility
+
                 roi = calculate_roi(
                     solar_kwp=solar["system_kwp"],
                     battery_kwh=battery_kwh_rec,
                     monthly_generation_kwh=solar["monthly_generation_kwh_avg"],
-                    md_reduction_kw=float(batt.get("md_reduction_kw", 0.0)),
+                    md_reduction_kw=md_reduction_kw,
                     self_consumption_pct=self_cons,
                     schedule_key=sched_key,
                     tariff=st.session_state.tariff_code,
@@ -2684,74 +2829,218 @@ with tab5:
             st.code(traceback.format_exc())
 
     if st.session_state.solar_sizing and st.session_state.roi:
-        solar = st.session_state.solar_sizing
-        batt  = st.session_state.battery_sizing
-        roi   = st.session_state.roi
+        solar       = st.session_state.solar_sizing
+        batt        = st.session_state.battery_sizing
+        roi         = st.session_state.roi
+        feasibility = st.session_state.get("powerreco_feasibility")
+
+        # ─────────────────────────────────────────────────────────────
+        # 1. FEASIBILITY GATE — the first thing you see
+        # ─────────────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("🔍 Investment Feasibility")
+        st.caption(
+            "Pre-screening verdict BEFORE committing to sizing or ROI details.  "
+            "VIABLE = confident payback within threshold.  "
+            "MARGINAL = borderline — sensitive to tariff escalation.  "
+            "NOT VIABLE = unlikely to recover investment."
+        )
+
+        if feasibility:
+            _VERDICT_COLOR = {
+                "VIABLE":             "#22c55e",
+                "MARGINAL":           "#f59e0b",
+                "NOT_VIABLE":         "#ef4444",
+                "INSUFFICIENT_DATA":  "#9ca3af",
+            }
+            fc1, fc2 = st.columns(2)
+
+            with fc1:
+                sv = feasibility["solar_verdict"]
+                sc = _VERDICT_COLOR.get(sv, "#9ca3af")
+                st.markdown(
+                    f"<div style='border:1px solid {sc};border-radius:8px;padding:14px'>"
+                    f"<span style='font-size:18px;font-weight:700;color:{sc}'>☀️ Solar — {sv}</span><br>"
+                    + "".join(f"<p style='margin:4px 0;font-size:13px'>{r}</p>" for r in feasibility["solar_reasons"])
+                    + (f"<p style='margin-top:8px;font-size:13px'>"
+                       f"Estimated payback: <b>{feasibility['estimated_payback_solar_yrs']} yrs</b></p>"
+                       if feasibility.get("estimated_payback_solar_yrs") else "")
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            with fc2:
+                bv = feasibility["battery_verdict"]
+                bc = _VERDICT_COLOR.get(bv, "#9ca3af")
+                st.markdown(
+                    f"<div style='border:1px solid {bc};border-radius:8px;padding:14px'>"
+                    f"<span style='font-size:18px;font-weight:700;color:{bc}'>🔋 Battery — {bv}</span><br>"
+                    + "".join(f"<p style='margin:4px 0;font-size:13px'>{r}</p>" for r in feasibility["battery_reasons"])
+                    + (f"<p style='margin-top:8px;font-size:13px'>"
+                       f"Estimated payback: <b>{feasibility['estimated_payback_battery_yrs']} yrs</b></p>"
+                       if feasibility.get("estimated_payback_battery_yrs") else "")
+                    + "</div>",
+                    unsafe_allow_html=True,
+                )
+
+            st.info(f"**Recommendation:** {feasibility['recommendation']}")
+            for cav in feasibility.get("caveats", []):
+                st.caption(f"ℹ️ {cav}")
+
+            # If neither component is viable, stop here — don't show misleading ROI
+            if not feasibility["solar_viable"] and not feasibility["battery_viable"]:
+                st.warning(
+                    "Neither solar nor battery investment appears financially viable under "
+                    "current parameters.  Review load profile, tariff schedule, and cost inputs.  "
+                    "Detailed ROI figures are hidden to avoid misleading analysis."
+                )
+                st.stop()
 
         st.divider()
-        st.subheader("Solar System")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("System Size",     f"{solar['system_kwp']} kWp")
-        c2.metric("Panels",          f"{solar['n_panels']} × {solar['panel_wattage_w']}W")
-        c3.metric("Annual Output",   f"{solar['annual_generation_kwh']:,} kWh")
-        c4.metric("Usable Roof",     f"{solar['usable_area_m2']} m²")
 
-        # Monthly generation chart
-        fig = go.Figure(go.Bar(
-            x=solar["month_labels"],
-            y=solar["monthly_breakdown_kwh"],
-            marker_color="#ff7f0e",
-            name="Monthly kWh",
-        ))
-        fig.update_layout(title="Monthly Solar Generation (Malaysia seasonal factors)",
-                          yaxis_title="kWh", height=300)
-        st.plotly_chart(fig, use_container_width=True)
+        # ─────────────────────────────────────────────────────────────
+        # 2. RECOMMENDED SYSTEM — single best option
+        # ─────────────────────────────────────────────────────────────
+        st.subheader("⭐ Recommended System")
 
-        st.subheader("Battery Sizing")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Recommended",     f"{batt['min_capacity_kwh_commercial']} kWh")
-        c2.metric("MD Reduction",    f"{batt.get('md_reduction_kw', 0):.1f} kW")
-        c3.metric("Days Analysed",   batt.get("n_days_analyzed", "N/A"))
+        r1, r2 = st.columns(2)
+        with r1:
+            st.markdown("**Solar PV**")
+            rc1, rc2, rc3 = st.columns(3)
+            rc1.metric("System size",   f"{solar['system_kwp']} kWp")
+            rc2.metric("Panels",        f"{solar['n_panels']} × {solar['panel_wattage_w']} W")
+            rc3.metric("Annual output", f"{solar['annual_generation_kwh']:,} kWh")
+        with r2:
+            st.markdown("**Battery Storage**")
+            rb1, rb2, rb3 = st.columns(3)
+            rb1.metric("Capacity",      f"{batt['min_capacity_kwh_commercial']} kWh")
+            rb2.metric("MD reduction",  f"{batt.get('md_reduction_kw', 0):.1f} kW")
+            rb3.metric("Days analysed", batt.get("n_days_analyzed", "N/A"))
         if "spike_note" in batt:
             st.caption(batt["spike_note"])
 
-        st.subheader("25-Year Financial Return")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total CAPEX",     _fmt_rm(roi["total_capex_rm"]))
-        c2.metric("Simple Payback",  f"{roi['simple_payback_years']} yrs")
-        c3.metric("NPV (25 yr)",     _fmt_rm(roi["npv_25yr_rm"]))
-        c4.metric("IRR",             f"{roi['irr_pct']}%" if roi["irr_pct"] else "N/A")
+        # ─────────────────────────────────────────────────────────────
+        # 3. CAPEX BREAKDOWN — per component, not a single lump sum
+        # ─────────────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("💰 CAPEX Breakdown")
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Annual Energy Savings", _fmt_rm(roi["annual_energy_savings_rm"]))
-        c2.metric("Annual MD Savings",     _fmt_rm(roi["annual_md_savings_rm"]))
-        c3.metric("Annual NEM Credit",     _fmt_rm(roi["annual_nem_credit_rm"]))
+        solar_panels_rm  = roi["solar_capex_rm"]
+        inverter_rm      = roi["inverter_capex_rm"]
+        battery_rm       = roi["battery_capex_rm"]
+        total_capex_rm   = roi["total_capex_rm"]
+
+        capex_c1, capex_c2, capex_c3, capex_c4 = st.columns(4)
+        capex_c1.metric(
+            "Solar panels",
+            _fmt_rm(solar_panels_rm),
+            delta=f"RM {solar_cost:,.0f}/kWp × {solar['system_kwp']} kWp",
+            delta_color="off",
+        )
+        capex_c2.metric(
+            "Inverter",
+            _fmt_rm(inverter_rm),
+            delta=f"RM {roi.get('inverter_cost_per_kwp_rm', solar['inverter_cost_per_kwp_rm']):,.0f}/kWp · {solar.get('inverter_tier','')[:25]}",
+            delta_color="off",
+        )
+        capex_c3.metric(
+            "Battery",
+            _fmt_rm(battery_rm),
+            delta=f"RM {batt_cost:,.0f}/kWh × {batt['min_capacity_kwh_commercial']} kWh",
+            delta_color="off",
+        )
+        capex_c4.metric("Total CAPEX", _fmt_rm(total_capex_rm))
+
+        # CAPEX pie chart
+        if solar_panels_rm + inverter_rm + battery_rm > 0:
+            fig_pie = go.Figure(go.Pie(
+                labels=["Solar panels", "Inverter", "Battery"],
+                values=[solar_panels_rm, inverter_rm, battery_rm],
+                hole=0.45,
+                marker=dict(colors=["#f59e0b", "#00b4d8", "#a78bfa"]),
+                textinfo="label+percent",
+            ))
+            fig_pie.update_layout(
+                title="CAPEX composition",
+                height=280,
+                showlegend=False,
+                margin=dict(t=40, b=10, l=10, r=10),
+            )
+            st.plotly_chart(fig_pie, use_container_width=True)
+
+        st.caption(
+            f"Inverter note: {solar.get('inverter_note', '')}"
+        )
+
+        # ─────────────────────────────────────────────────────────────
+        # 4. FINANCIAL RETURNS
+        # ─────────────────────────────────────────────────────────────
+        st.divider()
+        st.subheader("📈 25-Year Financial Return")
+
+        fin1, fin2, fin3, fin4 = st.columns(4)
+        fin1.metric("Simple payback",  f"{roi['simple_payback_years']} yrs")
+        fin2.metric("NPV (25 yr)",     _fmt_rm(roi["npv_25yr_rm"]))
+        fin3.metric("IRR",             f"{roi['irr_pct']}%" if roi["irr_pct"] else "N/A")
+        fin4.metric("Monthly net benefit", _fmt_rm(roi["monthly_net_benefit_rm"]))
+
+        ann1, ann2, ann3 = st.columns(3)
+        ann1.metric("Annual energy savings", _fmt_rm(roi["annual_energy_savings_rm"]))
+        ann2.metric("Annual MD savings",     _fmt_rm(roi["annual_md_savings_rm"]))
+        ann3.metric("Annual NEM credit",     _fmt_rm(roi["annual_nem_credit_rm"]))
+
+        st.caption(
+            f"CO₂ offset: **{roi['co2_offset_tonnes_yr']:.1f} t/year**  ·  "
+            f"Self-consumption: {self_cons*100:.0f}%  ·  "
+            f"MD rate: RM {roi['md_rate_used']:.2f}/kW/month  ·  "
+            f"Tax multiplier: {roi.get('tax_multiplier_used', 1.077):.3f}"
+        )
 
         # Cumulative NPV chart
         years = list(range(1, len(roi["cumulative_npv"]) + 1))
         fig2 = go.Figure()
         fig2.add_hline(y=0, line_dash="dash", line_color="gray")
+        # Battery replacement annotation at year 10
+        fig2.add_vline(x=10, line_dash="dot", line_color="#f59e0b",
+                       annotation_text="Battery replacement", annotation_position="top right")
         fig2.add_trace(go.Scatter(
             x=years, y=roi["cumulative_npv"],
             mode="lines+markers", name="Cumulative NPV",
             line=dict(color="#2ca02c", width=2),
             fill="tozeroy", fillcolor="rgba(44,160,44,0.15)",
+            marker=dict(size=4),
         ))
-        fig2.update_layout(title="Cumulative NPV over 25 Years",
-                           xaxis_title="Year", yaxis_title="RM",
-                           height=380)
+        fig2.update_layout(
+            title="Cumulative NPV over 25 Years",
+            xaxis_title="Year", yaxis_title="RM",
+            height=380,
+        )
         st.plotly_chart(fig2, use_container_width=True)
 
-        st.caption(
-            f"CO₂ offset: **{roi['co2_offset_tonnes_yr']:.1f} tonnes/year**  |  "
-            f"Self-consumption: {self_cons*100:.0f}%  |  "
-            f"MD rate: RM {roi['md_rate_used']}/kW/month"
-        )
+        # Monthly solar generation chart
+        with st.expander("Monthly solar generation profile"):
+            fig_sol = go.Figure(go.Bar(
+                x=solar["month_labels"],
+                y=solar["monthly_breakdown_kwh"],
+                marker_color="#f59e0b",
+                name="Monthly kWh",
+            ))
+            fig_sol.update_layout(
+                title="Monthly generation (Malaysia seasonal factors applied)",
+                yaxis_title="kWh", height=280,
+            )
+            st.plotly_chart(fig_sol, use_container_width=True)
 
         # Summary download
         summary = {
-            "solar_kwp": solar["system_kwp"],
-            "battery_kwh_recommended": batt["min_capacity_kwh_commercial"],
+            "solar_kwp":              solar["system_kwp"],
+            "battery_kwh":            batt["min_capacity_kwh_commercial"],
+            "solar_capex_rm":         roi["solar_capex_rm"],
+            "inverter_capex_rm":      roi["inverter_capex_rm"],
+            "battery_capex_rm":       roi["battery_capex_rm"],
+            "total_capex_rm":         roi["total_capex_rm"],
+            "feasibility_solar":      feasibility["solar_verdict"]   if feasibility else "N/A",
+            "feasibility_battery":    feasibility["battery_verdict"] if feasibility else "N/A",
             **{k: v for k, v in roi.items() if k != "cumulative_npv"},
         }
         import json
@@ -2761,102 +3050,6 @@ with tab5:
             file_name="powerreco_roi.json",
             mime="application/json",
         )
-
-        # ─────────────────────────────────────────────────────────────
-        # OPTIMUM SIZING — sweep (solar × battery) grid for best NPV
-        # ─────────────────────────────────────────────────────────────
-        st.divider()
-        st.subheader("🔍 Find optimum sizing")
-        st.caption(
-            "Sweeps a grid of solar + battery sizes against the same tariff "
-            "schedule and reports the configuration with the highest 25-yr NPV. "
-            "MD reduction at non-measured battery sizes is approximated from "
-            "the measured Manager result with diminishing-returns scaling."
-        )
-
-        ob1, ob2 = st.columns([2, 1])
-        with ob1:
-            budget_rm = st.number_input(
-                "Budget ceiling (RM, 0 = no cap)", 0, 5_000_000,
-                int(_so("budget_rm", 0)), step=50_000,
-                help="If set, also reports the best NPV configuration with total CAPEX ≤ this. "
-                     "Defaults to the Site Setup value.",
-            )
-        with ob2:
-            run_opt = st.button("Run sweep", use_container_width=True)
-
-        if run_opt:
-            try:
-                opt = find_optimum_from_existing_run(
-                    solar_sizing=solar,
-                    battery_sizing=batt,
-                    schedule_key=sched_key,
-                    tariff=st.session_state.tariff_code,
-                    self_consumption_pct=self_cons,
-                    solar_cost_per_kwp=solar_cost,
-                    battery_cost_per_kwh=batt_cost,
-                    budget_rm=float(budget_rm) if budget_rm > 0 else None,
-                )
-                st.session_state.sizing_sweep = opt
-            except Exception as e:
-                st.error(f"Optimizer failed: {e}")
-                st.code(traceback.format_exc())
-
-        if st.session_state.get("sizing_sweep"):
-            opt = st.session_state.sizing_sweep
-            best = opt.get("best_npv")
-            best_b = opt.get("best_under_budget")
-            best_pb = opt.get("best_payback")
-
-            cb1, cb2, cb3 = st.columns(3)
-            if best:
-                cb1.metric(
-                    "Best NPV config",
-                    f"{best['solar_kwp']:.0f} kWp · {best['battery_kwh']:.0f} kWh",
-                    delta=f"NPV {best['npv_25yr_rm']:,.0f} RM",
-                )
-            if best_pb:
-                cb2.metric(
-                    "Shortest payback",
-                    f"{best_pb['solar_kwp']:.0f} kWp · {best_pb['battery_kwh']:.0f} kWh",
-                    delta=f"{best_pb['payback_yrs']:.1f} yrs",
-                )
-            if best_b:
-                cb3.metric(
-                    f"Best under RM {opt['budget_rm']:,.0f}" if opt.get('budget_rm') else "Best under budget",
-                    f"{best_b['solar_kwp']:.0f} kWp · {best_b['battery_kwh']:.0f} kWh",
-                    delta=f"NPV {best_b['npv_25yr_rm']:,.0f} RM",
-                )
-            elif opt.get('budget_rm'):
-                cb3.warning("No config fits the budget — try increasing it or lowering unit costs.")
-
-            # NPV heatmap
-            try:
-                import plotly.express as px
-                import numpy as np
-                z = np.array(opt['npv_matrix']) / 1000.0  # show as k-RM
-                fig_hm = go.Figure(data=go.Heatmap(
-                    z=z,
-                    x=[f"{int(b)} kWh" for b in opt['grid_battery_kwh']],
-                    y=[f"{int(s)} kWp" for s in opt['grid_solar_kwp']],
-                    colorscale="Viridis",
-                    colorbar=dict(title="NPV (k RM)"),
-                    hovertemplate="Solar %{y}<br>Battery %{x}<br>NPV %{z:.0f}k RM<extra></extra>",
-                ))
-                fig_hm.update_layout(
-                    title="25-yr NPV by (Solar × Battery)",
-                    xaxis_title="Battery capacity",
-                    yaxis_title="Solar capacity",
-                    height=380,
-                )
-                st.plotly_chart(fig_hm, use_container_width=True)
-            except Exception as e:
-                st.warning(f"Heatmap render failed: {e}")
-
-            # Full grid table
-            with st.expander("Full sweep results"):
-                pts_df = pd.DataFrame(opt['points'])
-                st.dataframe(pts_df, use_container_width=True, hide_index=True)
 
         # ─────────────────────────────────────────────────────────────
         # ENERGY FLOWS — stacked daily chart + annual Sankey + KPIs
