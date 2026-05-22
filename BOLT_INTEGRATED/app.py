@@ -105,6 +105,10 @@ for key, default in [
     # Accumulates the FIRST row of each tick's Manager output — the decision
     # actually executed on the live actual reading, not the forecast plan.
     ("executed_ticks", []),
+    # Tracks which site_id the auto historical Manager run was last completed
+    # for. Reset to None by _invalidate_downstream() so a new data upload or
+    # site switch triggers a fresh auto-run.
+    ("_auto_manager_site", None),
     # Completed-month bills derived from executed_ticks. Each entry is:
     # {"month": "YYYY-MM", "ticks": int, "before": {...}, "after": {...}, "savings_rm": float}
     ("live_bill_months", []),
@@ -463,6 +467,83 @@ def _invalidate_downstream():
                 "manager_df_optimized", "manager_df_original", "powerreco_df",
                 "solar_sizing", "battery_sizing", "roi", "sizing_sweep"):
         st.session_state[key] = None
+    # Reset the auto-run flag so a new upload or site switch triggers a fresh run.
+    st.session_state["_auto_manager_site"] = None
+
+
+def _ensure_historical_manager() -> bool:
+    """
+    Run the AI Manager on the full uploaded dataset if it hasn't been run yet
+    for the current site in this session.  Uses the site profile defaults
+    layered with whatever overrides the user has set in Site Setup.
+
+    Called automatically after data upload and on app start-up so the
+    Calculator and PowerRECO always have reference data without requiring
+    the user to manually click 'Run on full history'.
+
+    Returns True if a run was performed, False if skipped (already done,
+    no data, or an error occurred).
+    """
+    site_id = st.session_state.site_profile_id
+    if st.session_state.df is None:
+        return False
+    if st.session_state.manager_results is not None:
+        return False
+    if st.session_state.get("_auto_manager_site") == site_id:
+        return False   # already ran for this site this session
+
+    # Mark immediately so a Streamlit rerun doesn't trigger a second run.
+    st.session_state["_auto_manager_site"] = site_id
+
+    try:
+        profile = get_profile(site_id)
+        loads   = profile_loads_for_manager(profile)
+
+        # Apply any overrides the user may have set (same logic as live Manager).
+        ov = _site_overrides_for(site_id)
+        if "ev" in loads:
+            ev = loads["ev"]
+            if any(k in ov for k in ("ev_count", "ev_kw_each", "ev_kind")):
+                c   = int(ov.get("ev_count",   4))
+                kwe = float(ov.get("ev_kw_each", 22.0))
+                kd  = str(ov.get("ev_kind",    "AC"))
+                ev["ev_chargers"] = [{"count": c, "kw_each": kwe, "kind": kd}]
+                ev["ev_total_kw"] = c * kwe
+            if any(k in ov for k in ("ev_window_start", "ev_window_end")):
+                ev["allowed_window"] = [
+                    int(ov.get("ev_window_start", 18)),
+                    int(ov.get("ev_window_end",    8)),
+                ]
+        if "hvac" in loads:
+            hv = loads["hvac"]
+            if any(k in ov for k in ("hvac_protect_start", "hvac_protect_end")):
+                hv["protected_window"] = [
+                    int(ov.get("hvac_protect_start",  9)),
+                    int(ov.get("hvac_protect_end",   17)),
+                ]
+            if "hvac_max_cut_pct" in ov:
+                hv["max_cut_pct"] = float(ov["hvac_max_cut_pct"]) / 100.0
+
+        mgr_df  = historical_to_manager_df(st.session_state.df)
+        results = run_ai_manager(
+            mgr_df, loads,
+            battery_capacity_kwh  = float(_so("battery_kwh",      profile.battery_kwh)),
+            priority_order        = list(loads.keys()),
+            peak_target_pct       = float(_so("md_target_pct",    profile.md_target_pct)),
+            bat_charge_upper_pct  = float(_so("charge_upper_pct", profile.charge_upper_pct)),
+            c_rate                = float(_so("c_rate",            profile.c_rate)),
+            initial_soc_pct       = float(_so("init_soc_pct",     profile.initial_soc_pct)),
+            bat_efficiency        = 0.95,
+        )
+        st.session_state.manager_results      = results
+        st.session_state.manager_df_optimized = manager_results_to_sam_df(results)
+        st.session_state.manager_df_original  = manager_results_to_original_df(results)
+        st.session_state.powerreco_df         = manager_results_to_powerreco_df(results)
+        return True
+    except Exception:
+        # Silent failure — user can always run manually from the Manager tab.
+        st.session_state["_auto_manager_site"] = None  # allow retry on next render
+        return False
 
 
 def _collect_assumptions() -> list[dict]:
@@ -654,6 +735,18 @@ def _bootstrap_active_site():
 
 
 _bootstrap_active_site()
+
+# Auto-run the historical Manager if data is loaded but results are missing.
+# This fires once per site per session so the Calculator and PowerRECO always
+# have reference data without requiring a manual button click.
+if (st.session_state.df is not None
+        and st.session_state.manager_results is None
+        and st.session_state.get("_auto_manager_site") != st.session_state.site_profile_id):
+    with st.spinner(
+        f"Auto-running historical Manager for "
+        f"{get_profile(st.session_state.site_profile_id).name}…"
+    ):
+        _ensure_historical_manager()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1243,6 +1336,9 @@ with tab1:
             # Persist for the active site — survives browser refresh + restart.
             _active_site = st.session_state.site_profile_id
             save_load_profile(_active_site, df)
+
+            # Clear auto-run flag so the Manager re-runs on the fresh data.
+            st.session_state["_auto_manager_site"] = None
 
             st.success(f"Loaded {summ['rows']:,} intervals  |  "
                        f"{summ['days']} days  |  "
@@ -2200,6 +2296,8 @@ with tab3:
             st.session_state.manager_df_optimized = manager_results_to_sam_df(_hist_results)
             st.session_state.manager_df_original  = manager_results_to_original_df(_hist_results)
             st.session_state.powerreco_df         = manager_results_to_powerreco_df(_hist_results)
+            # Mark as done so the auto-run doesn't fire again this session.
+            st.session_state["_auto_manager_site"] = st.session_state.site_profile_id
             st.success(f"✅ Historical run complete — {len(_hist_results):,} intervals processed.")
         except Exception as e:
             st.error(f"Manager failed: {e}")
