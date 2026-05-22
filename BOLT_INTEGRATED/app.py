@@ -105,6 +105,9 @@ for key, default in [
     # Accumulates the FIRST row of each tick's Manager output — the decision
     # actually executed on the live actual reading, not the forecast plan.
     ("executed_ticks", []),
+    # Completed-month bills derived from executed_ticks. Each entry is:
+    # {"month": "YYYY-MM", "ticks": int, "before": {...}, "after": {...}, "savings_rm": float}
+    ("live_bill_months", []),
     # Per-site override dict: {site_id: {field: user_value}}.  Any field not
     # in here falls back to the site profile preset.  Editing in the Site
     # Setup tab populates these; switching site profile in the sidebar
@@ -366,6 +369,87 @@ def _run_manager_on_live_forecast() -> list | None:
         )
     except Exception:
         return None
+
+
+def _compute_live_month_bill(
+    month_str: str,
+    ticks: list[dict],
+    tariff: str,
+    sched_key: str,
+    icpt_sen: float,
+    nem_rate: float,
+) -> dict:
+    """
+    Compute before/after TNB monthly bill from a list of executed Manager ticks
+    belonging to a single calendar month.
+
+    Each tick dict (from executed_ticks) contains:
+        kw_original, kvar_original  — raw pre-optimization readings
+        kw_managed,  kvar_managed   — post-optimization values
+
+    Returns a dict ready to append to session_state.live_bill_months.
+    """
+    orig_rows, mgd_rows = [], []
+    for t in ticks:
+        ts = pd.to_datetime(t["timestamp"])
+        orig_rows.append({
+            "timestamp":   ts,
+            "kw_import":   float(t.get("kw_original",  t.get("kw_managed", 0))),
+            "kw_export":   0.0,
+            "kvar_import": float(t.get("kvar_original", t.get("kvar_managed", 0))),
+            "kvar_export": 0.0,
+        })
+        mgd_rows.append({
+            "timestamp":   ts,
+            "kw_import":   float(t.get("kw_managed",  0)),
+            "kw_export":   0.0,
+            "kvar_import": float(t.get("kvar_managed", 0)),
+            "kvar_export": 0.0,
+        })
+
+    def _bill_for(rows: list[dict]) -> dict:
+        if not rows:
+            return {}
+        df_m = pd.DataFrame(rows)
+        stats = compute_monthly_stats(df_m, schedule_key=sched_key)
+        if stats.empty:
+            return {}
+        row = stats.iloc[0]
+        b   = calculate_bill(
+            tariff,
+            monthly_kwh     = float(row["total_kwh"]),
+            peak_kwh        = float(row["peak_kwh"]),
+            offpeak_kwh     = float(row["offpeak_kwh"]),
+            max_demand_kw   = float(row["max_demand_kw"]),
+            icpt_sen_per_kwh= icpt_sen,
+            schedule_key    = sched_key,
+        )
+        nem = compute_nem_credit(float(row["export_kwh"]), nem_rate)
+        return {
+            "total_kwh":     round(float(row["total_kwh"]), 1),
+            "peak_kw_md":    round(float(row["max_demand_kw"]), 1),
+            "energy_rm":     b["energy_charge"],
+            "md_rm":         b["md_charge"],
+            "icpt_rm":       b["icpt_charge"],
+            "kwtbb_rm":      b["kwtbb_charge"],
+            "tax_rm":        b["service_tax"],
+            "nem_credit_rm": nem["nem_credit_rm"],
+            "net_bill_rm":   round(b["total_bill"] - nem["nem_credit_rm"], 2),
+        }
+
+    before = _bill_for(orig_rows)
+    after  = _bill_for(mgd_rows)
+    savings = round(
+        before.get("net_bill_rm", 0) - after.get("net_bill_rm", 0), 2
+    ) if before and after else 0.0
+
+    return {
+        "month":      month_str,
+        "ticks":      len(ticks),
+        "before":     before,
+        "after":      after,
+        "savings_rm": savings,
+    }
 
 
 def _invalidate_downstream():
@@ -1543,6 +1627,7 @@ with tab_live:
         st.session_state.live_manager_results  = None
         st.session_state.live_manager_last_tick = -1
         st.session_state.executed_ticks         = []
+        st.session_state.live_bill_months       = []
         st.rerun()
 
     sp1, sp2 = st.columns([3, 2])
@@ -1602,6 +1687,34 @@ with tab_live:
                         if not _exec or _exec[-1].get("timestamp") != _new_ts:
                             _exec.append(dict(_lm[0]))
                             st.session_state.executed_ticks = _exec
+
+                            # Month-boundary detection: when the sim crosses into
+                            # a new calendar month, compute + store the completed
+                            # month's bill so the Calculator tab can display it.
+                            if len(_exec) >= 2:
+                                try:
+                                    _prev_m = pd.to_datetime(_exec[-2]["timestamp"]).to_period("M")
+                                    _curr_m = pd.to_datetime(_exec[-1]["timestamp"]).to_period("M")
+                                    if _curr_m > _prev_m:
+                                        _bms  = st.session_state.get("live_bill_months", [])
+                                        _done = {b["month"] for b in _bms}
+                                        if str(_prev_m) not in _done:
+                                            _m_ticks = [
+                                                t for t in _exec
+                                                if pd.to_datetime(t["timestamp"]).to_period("M") == _prev_m
+                                            ]
+                                            if _m_ticks:
+                                                _mb = _compute_live_month_bill(
+                                                    str(_prev_m), _m_ticks,
+                                                    tariff    = st.session_state.tariff_code,
+                                                    sched_key = st.session_state.tariff_schedule_key,
+                                                    icpt_sen  = float(_so("icpt_sen", 0.0)),
+                                                    nem_rate  = float(_so("nem_rate", 0.31)),
+                                                )
+                                                _bms.append(_mb)
+                                                st.session_state.live_bill_months = _bms
+                                except Exception:
+                                    pass
                     # ── #2 SOC CONTINUITY ──────────────────────────────────
                     # Save the SOC AFTER the first interval (which is the
                     # decision we're "executing" this tick) so the next
@@ -1919,15 +2032,183 @@ with tab_live:
 with tab3:
     st.header("AI Load Manager")
     st.caption(
-        "Runs peak-shaving and load-shifting optimization on the loaded data. "
-        "Uses the exact discharge formula: dis_kw = kW − √(trigger² − kVAR²)."
+        "Configure parameters first, then activate the live simulation or run a "
+        "historical analysis.  Discharge formula: dis_kw = kW − √(trigger² − kVAR²)."
     )
 
+    if st.session_state.df is None:
+        st.warning("Upload a load profile first.")
+        st.stop()
+
+    df      = st.session_state.df
+    profile = get_profile(st.session_state.site_profile_id)
+
     # ═════════════════════════════════════════════════════════════════════
-    # LIVE FORWARD STRATEGY — re-renders every sim tick from the same
-    # forecast the Live Simulation tab is advancing.  When the sim is
-    # paused or hasn't been started, this shows the most recent computed
-    # plan (or an empty state).
+    # SECTION A: CONFIGURATION — set ALL parameters before anything runs
+    # ═════════════════════════════════════════════════════════════════════
+    st.subheader("⚙️ Manager Configuration")
+    st.caption(
+        "Set battery capacity, dispatch thresholds, and load priorities here.  "
+        "Click **Apply to live simulation** to activate — the live view below "
+        "will use these settings from the next sim tick onwards."
+    )
+
+    with st.expander("Battery & dispatch settings", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        battery_kwh  = c1.number_input(
+            "Battery capacity (kWh)", 50.0, 5000.0,
+            float(_so("battery_kwh", profile.battery_kwh)) or profile.battery_kwh,
+            step=50.0,
+        )
+        c_rate       = c2.number_input(
+            "C-rate", 0.1, 1.0, float(_so("c_rate", profile.c_rate)), step=0.1,
+            help="Max charge/discharge rate as fraction of capacity per hour",
+        )
+        bat_eff      = c3.number_input("One-way efficiency", 0.80, 1.00, 0.95, step=0.01)
+
+        c4, c5, c6 = st.columns(3)
+        peak_target  = c4.slider(
+            "Peak target (% of ref peak)", 70, 95,
+            int(_so("md_target_pct", profile.md_target_pct) * 100),
+        ) / 100
+        charge_upper = c5.slider(
+            "Charge upper threshold (% of ref peak)", 50, 90,
+            int(_so("charge_upper_pct", profile.charge_upper_pct) * 100),
+        ) / 100
+        init_soc     = c6.slider(
+            "Initial SOC (%)", 20, 80,
+            int(_so("init_soc_pct", profile.initial_soc_pct) * 100),
+        ) / 100
+
+        c7, c8 = st.columns(2)
+        peak_ref_kva = c7.number_input(
+            "Reference peak kVA (0 = auto rolling 30-day)", 0.0, 10000.0, 0.0, step=10.0,
+        )
+        pre_md_hours = c8.number_input("Pre-MD boost window (hours)", 0, 4, 2)
+
+    st.subheader("Load configuration")
+    st.caption(
+        f"Loads pre-populated from **{profile.name}**.  "
+        "EV charging window and HVAC protect hours feed the window-aware dispatch logic."
+    )
+
+    loads: dict          = {}
+    priority_order: list = []
+
+    _profile_load_keys = list(profile.loads.keys())
+    _load_cols         = st.columns(len(_profile_load_keys))
+    for _col, lk in zip(_load_cols, _profile_load_keys):
+        ld = profile.loads[lk]
+        with _col:
+            st.markdown(f"**{ld.name}**  \n*{ld.kind}*")
+            lname = st.text_input(f"Name [{lk}]", ld.name, key=f"mgr_name_{lk}",
+                                   label_visibility="collapsed")
+            lprop = st.number_input(f"Proportion [{lk}]", 0.0, 1.0,
+                                     float(ld.proportion), step=0.05, key=f"mgr_prop_{lk}")
+            lcut  = st.number_input(f"Max cut % [{lk}]", 0, 100,
+                                     int(ld.max_cut_pct * 100), key=f"mgr_cut_{lk}")
+            entry = {
+                "name": lname, "proportion": lprop,
+                "max_cut_pct": lcut / 100, "kind": ld.kind,
+            }
+
+            if ld.kind == "ev":
+                st.caption("🚙 EV chargers")
+                _ev0 = ld.ev_chargers[0] if ld.ev_chargers else None
+                e_count = st.number_input("# chargers", 0, 50,
+                                           int(_so("ev_count", _ev0.count if _ev0 else 4)),
+                                           key=f"mgr_evcount_{lk}")
+                e_kw    = st.number_input("kW each", 3.6, 250.0,
+                                           float(_so("ev_kw_each", _ev0.kw_each if _ev0 else 22.0)),
+                                           step=1.0, key=f"mgr_evkw_{lk}")
+                _kind_def = _so("ev_kind", _ev0.kind if _ev0 else "AC")
+                e_kind  = st.selectbox("AC / DC", ["AC", "DC"],
+                                        index=0 if _kind_def == "AC" else 1,
+                                        key=f"mgr_evkind_{lk}")
+                w_start_d, w_end_d = (ld.allowed_window or (18, 8))
+                e_ws = st.number_input("Charge window start (h)", 0, 23,
+                                        int(_so("ev_window_start", w_start_d)),
+                                        key=f"mgr_evws_{lk}")
+                e_we = st.number_input("Charge window end (h)", 0, 23,
+                                        int(_so("ev_window_end", w_end_d)),
+                                        key=f"mgr_evwe_{lk}")
+                entry["ev_chargers"]    = [{"count": int(e_count), "kw_each": float(e_kw), "kind": e_kind}]
+                entry["ev_total_kw"]    = int(e_count) * float(e_kw)
+                entry["allowed_window"] = [int(e_ws), int(e_we)]
+
+            if ld.kind == "hvac" and ld.protected_window:
+                st.caption("❄️ Protected business hours")
+                w_start_d, w_end_d = ld.protected_window
+                p_ws = st.number_input("Protect from (h)", 0, 23,
+                                        int(_so("hvac_protect_start", w_start_d)),
+                                        key=f"mgr_hws_{lk}")
+                p_we = st.number_input("Protect to (h)", 0, 23,
+                                        int(_so("hvac_protect_end", w_end_d)),
+                                        key=f"mgr_hwe_{lk}")
+                entry["protected_window"] = [int(p_ws), int(p_we)]
+
+            loads[lk] = entry
+            priority_order.append(lk)
+
+    # Action buttons — Apply (live) and Run (historical) side by side
+    _btn1, _btn2 = st.columns(2)
+    _apply_live = _btn1.button(
+        "▶ Apply to live simulation", type="primary", use_container_width=True,
+        help="Writes settings to session state so the live Manager picks them up from "
+             "the next sim tick.  Does not re-run history.",
+    )
+    _run_hist = _btn2.button(
+        "🔁 Run on full history", use_container_width=True,
+        help="Run Manager over the entire uploaded dataset for a historical "
+             "'what-if' analysis.  Independent of the live simulation.",
+    )
+
+    if _apply_live:
+        _set_so("battery_kwh",      battery_kwh)
+        _set_so("c_rate",           c_rate)
+        _set_so("md_target_pct",    peak_target)
+        _set_so("charge_upper_pct", charge_upper)
+        _set_so("init_soc_pct",     init_soc)
+        for lk, entry in loads.items():
+            if entry.get("kind") == "ev":
+                _ev_ch = (entry.get("ev_chargers") or [{}])[0]
+                _set_so("ev_count",        int(_ev_ch.get("count",   4)))
+                _set_so("ev_kw_each",      float(_ev_ch.get("kw_each", 22.0)))
+                _set_so("ev_kind",         _ev_ch.get("kind", "AC"))
+                if "allowed_window" in entry:
+                    _set_so("ev_window_start", int(entry["allowed_window"][0]))
+                    _set_so("ev_window_end",   int(entry["allowed_window"][1]))
+            if entry.get("kind") == "hvac" and "protected_window" in entry:
+                _set_so("hvac_protect_start", int(entry["protected_window"][0]))
+                _set_so("hvac_protect_end",   int(entry["protected_window"][1]))
+                _set_so("hvac_max_cut_pct",   int(entry.get("max_cut_pct", 0.15) * 100))
+        save_overrides(st.session_state.site_overrides)
+        st.session_state.live_manager_results = None  # force recompute on next tick
+        st.success("✅ Settings applied — live simulation will use them from the next tick.")
+        st.rerun()
+
+    if _run_hist:
+        try:
+            with st.spinner("Optimizing full load profile…"):
+                _hist_results = _run_manager_on_df(
+                    df, loads, priority_order,
+                    battery_kwh, peak_target, charge_upper,
+                    c_rate, init_soc, bat_eff,
+                    peak_ref_kva if peak_ref_kva > 0 else None,
+                )
+            st.session_state.manager_results      = _hist_results
+            st.session_state.manager_df_optimized = manager_results_to_sam_df(_hist_results)
+            st.session_state.manager_df_original  = manager_results_to_original_df(_hist_results)
+            st.session_state.powerreco_df         = manager_results_to_powerreco_df(_hist_results)
+            st.success(f"✅ Historical run complete — {len(_hist_results):,} intervals processed.")
+        except Exception as e:
+            st.error(f"Manager failed: {e}")
+            st.code(traceback.format_exc())
+
+    st.divider()
+
+    # ═════════════════════════════════════════════════════════════════════
+    # SECTION B: LIVE VIEW — re-renders every sim tick
     # ═════════════════════════════════════════════════════════════════════
     _mgr_tick_rate = float(st.session_state.get("lsim_tickrate", 0.5))
 
@@ -2328,132 +2609,9 @@ with tab3:
 
     _live_manager_view()
 
-    st.divider()
-    st.markdown("##### 🛠️ Manual run on historical data")
-    st.caption(
-        "Use this for after-the-fact 'what if we'd been active' analysis on "
-        "the uploaded load profile.  Independent of the live forward strategy."
-    )
-
-    if st.session_state.df is None:
-        st.warning("Upload a load profile first.")
-        st.stop()
-
-    df = st.session_state.df
-    profile = get_profile(st.session_state.site_profile_id)
-
-    with st.expander("Battery & optimization settings", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        battery_kwh   = c1.number_input("Battery capacity (kWh)", 50.0, 5000.0,
-                                          float(_so("battery_kwh", profile.battery_kwh)) or profile.battery_kwh, step=50.0)
-        c_rate        = c2.number_input("C-rate", 0.1, 1.0,
-                                          float(_so("c_rate", profile.c_rate)), step=0.1,
-                                         help="Max charge/discharge rate as fraction of capacity per hour")
-        bat_eff       = c3.number_input("One-way efficiency", 0.80, 1.00, 0.95, step=0.01)
-
-        c4, c5, c6 = st.columns(3)
-        peak_target   = c4.slider("Peak target (% of ref peak)", 70, 95,
-                                    int(_so("md_target_pct", profile.md_target_pct) * 100)) / 100
-        charge_upper  = c5.slider("Charge upper threshold (% of ref peak)", 50, 90,
-                                    int(_so("charge_upper_pct", profile.charge_upper_pct) * 100)) / 100
-        init_soc      = c6.slider("Initial SOC (%)", 20, 80,
-                                    int(_so("init_soc_pct", profile.initial_soc_pct) * 100)) / 100
-
-        c7, c8 = st.columns(2)
-        peak_ref_kva  = c7.number_input(
-            "Reference peak kVA (0 = auto from rolling 30-day)", 0.0, 10000.0, 0.0, step=10.0)
-        pre_md_hours  = c8.number_input("Pre-MD boost window (hours)", 0, 4, 2)
-
-    st.subheader("Load configuration")
-    st.caption(
-        f"Loads pre-populated from **{profile.name}**. EV charger details are "
-        f"first-class (count, kW, charging window) and feed the Manager's "
-        f"window-aware cut logic."
-    )
-
-    loads: dict = {}
-    priority_order: list[str] = []
-
-    # Profile-derived loads, rendered as per-load editable cards
-    profile_load_keys = list(profile.loads.keys())
-    cols = st.columns(len(profile_load_keys))
-    for col, lk in zip(cols, profile_load_keys):
-        ld = profile.loads[lk]
-        with col:
-            st.markdown(f"**{ld.name}**  \n*{ld.kind}*")
-            lname = st.text_input(f"Name [{lk}]", ld.name, key=f"mgr_name_{lk}",
-                                   label_visibility="collapsed")
-            lprop = st.number_input(f"Proportion [{lk}]", 0.0, 1.0,
-                                     float(ld.proportion), step=0.05,
-                                     key=f"mgr_prop_{lk}")
-            lcut  = st.number_input(f"Max cut % [{lk}]", 0, 100,
-                                     int(ld.max_cut_pct * 100),
-                                     key=f"mgr_cut_{lk}")
-            entry = {
-                "name":        lname,
-                "proportion":  lprop,
-                "max_cut_pct": lcut / 100,
-                "kind":        ld.kind,
-            }
-
-            # EV-specific block — reads from Site Setup overrides if present
-            if ld.kind == "ev":
-                st.caption("🚙 EV chargers")
-                _ev0 = ld.ev_chargers[0] if ld.ev_chargers else None
-                e_count = st.number_input("# chargers", 0, 50,
-                                           int(_so("ev_count", _ev0.count if _ev0 else 4)),
-                                           key=f"mgr_evcount_{lk}")
-                e_kw    = st.number_input("kW each", 3.6, 250.0,
-                                           float(_so("ev_kw_each", _ev0.kw_each if _ev0 else 22.0)),
-                                           step=1.0, key=f"mgr_evkw_{lk}")
-                _kind_def = _so("ev_kind", _ev0.kind if _ev0 else "AC")
-                e_kind  = st.selectbox("AC / DC", ["AC", "DC"],
-                                        index=0 if _kind_def == "AC" else 1,
-                                        key=f"mgr_evkind_{lk}")
-                w_start_d, w_end_d = (ld.allowed_window or (18, 8))
-                e_ws = st.number_input("Charge window start (h)", 0, 23,
-                                        int(_so("ev_window_start", w_start_d)),
-                                        key=f"mgr_evws_{lk}")
-                e_we = st.number_input("Charge window end (h)",   0, 23,
-                                        int(_so("ev_window_end",   w_end_d)),
-                                        key=f"mgr_evwe_{lk}")
-                entry["ev_chargers"]   = [{"count": int(e_count), "kw_each": float(e_kw), "kind": e_kind}]
-                entry["ev_total_kw"]   = int(e_count) * float(e_kw)
-                entry["allowed_window"] = [int(e_ws), int(e_we)]
-
-            # HVAC protected-hours block
-            if ld.kind == "hvac" and ld.protected_window:
-                st.caption("❄️ Protected business hours")
-                w_start_d, w_end_d = ld.protected_window
-                p_ws = st.number_input("Protect from (h)", 0, 23,
-                                        int(_so("hvac_protect_start", w_start_d)),
-                                        key=f"mgr_hws_{lk}")
-                p_we = st.number_input("Protect to (h)",   0, 23,
-                                        int(_so("hvac_protect_end", w_end_d)),
-                                        key=f"mgr_hwe_{lk}")
-                entry["protected_window"] = [int(p_ws), int(p_we)]
-
-            loads[lk] = entry
-            priority_order.append(lk)
-
-    if st.button("Run AI Manager", type="primary", use_container_width=True):
-        try:
-            with st.spinner("Optimizing load profile…"):
-                results = _run_manager_on_df(
-                    df, loads, priority_order,
-                    battery_kwh, peak_target, charge_upper,
-                    c_rate, init_soc, bat_eff,
-                    peak_ref_kva if peak_ref_kva > 0 else None,
-                )
-            st.session_state.manager_results    = results
-            st.session_state.manager_df_optimized = manager_results_to_sam_df(results)
-            st.session_state.manager_df_original  = manager_results_to_original_df(results)
-            st.session_state.powerreco_df         = manager_results_to_powerreco_df(results)
-            st.success(f"Optimization complete — {len(results):,} intervals processed.")
-        except Exception as e:
-            st.error(f"Manager failed: {e}")
-            st.code(traceback.format_exc())
-
+    # ═════════════════════════════════════════════════════════════════════
+    # SECTION C: HISTORICAL RUN RESULTS
+    # ═════════════════════════════════════════════════════════════════════
     if st.session_state.manager_results:
         results = st.session_state.manager_results
         res_df  = pd.DataFrame([
@@ -2507,15 +2665,194 @@ with tab3:
 # ─────────────────────────────────────────────────────────────────────────────
 with tab4:
     st.header("TNB Bill Calculator")
-    st.caption("Compares monthly electricity bills before and after AI Manager optimization.")
+    st.caption(
+        "Live monthly bills are computed automatically as each calendar month "
+        "completes in the simulation.  A historical batch mode is also available below."
+    )
+
+    # ── Shared billing settings (used by both live and historical modes) ──
+    with st.expander("Tariff & billing settings", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        tariff_options  = list(TARIFF_META.keys())
+        _tariff_default = _so("tariff_code", st.session_state.tariff_code)
+        default_idx     = tariff_options.index(_tariff_default) if _tariff_default in tariff_options else 2
+        tariff          = c1.selectbox("Tariff", tariff_options, index=default_idx,
+                                        format_func=lambda t: f"{t} — {TARIFF_META[t]['name']}")
+        icpt_sen        = c2.number_input("ICPT (sen/kWh)", -10.0, 20.0,
+                                           float(_so("icpt_sen", 0.0)), step=0.5,
+                                           help="Positive = surcharge, negative = rebate")
+        nem_rate        = c3.number_input("NEM buyback rate (RM/kWh)", 0.20, 0.50,
+                                           float(_so("nem_rate", 0.31)), step=0.01)
+
+    sched_key = st.session_state.tariff_schedule_key
+    st.caption(
+        f"Schedule in use: **{sched_key}** "
+        f"(toggle in sidebar to switch between July 2025 and legacy rates)."
+    )
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION A: LIVE MONTHLY BILL TRACKER
+    # Populated automatically each time a calendar month completes in the
+    # live simulation.  Bills are computed from executed_ticks (actual
+    # Manager decisions on real readings), not from the forecast.
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader("📅 Live Monthly Bill Tracker")
+
+    _live_bills = st.session_state.get("live_bill_months", [])
+
+    if _live_bills:
+        # Summary KPIs
+        _tot_before  = sum(m["before"].get("net_bill_rm", 0) for m in _live_bills)
+        _tot_after   = sum(m["after"].get("net_bill_rm",  0) for m in _live_bills)
+        _tot_savings = _tot_before - _tot_after
+        _n_months    = len(_live_bills)
+
+        lk1, lk2, lk3, lk4 = st.columns(4)
+        lk1.metric("Months completed",       f"{_n_months}")
+        lk2.metric("Total before (all)",      _fmt_rm(_tot_before))
+        lk3.metric("Total after (all)",        _fmt_rm(_tot_after),
+                   delta=f"−{_fmt_rm(_tot_savings)}", delta_color="inverse")
+        lk4.metric("Avg monthly savings",     _fmt_rm(_tot_savings / _n_months))
+
+        # Before vs After bar chart per month
+        _months_lbl  = [m["month"] for m in _live_bills]
+        _before_vals = [m["before"].get("net_bill_rm", 0) for m in _live_bills]
+        _after_vals  = [m["after"].get("net_bill_rm",  0) for m in _live_bills]
+        _sav_vals    = [m["savings_rm"] for m in _live_bills]
+
+        fig_live_bill = go.Figure()
+        fig_live_bill.add_trace(go.Bar(
+            name="Before optimisation", x=_months_lbl, y=_before_vals,
+            marker_color="#d62728",
+        ))
+        fig_live_bill.add_trace(go.Bar(
+            name="After optimisation",  x=_months_lbl, y=_after_vals,
+            marker_color="#1f77b4",
+        ))
+        fig_live_bill.add_trace(go.Scatter(
+            name="Savings (RM)", x=_months_lbl, y=_sav_vals,
+            mode="lines+markers+text",
+            line=dict(color="#22c55e", width=2.5),
+            marker=dict(size=8),
+            text=[f"RM {v:,.0f}" for v in _sav_vals],
+            textposition="top center",
+            yaxis="y2",
+        ))
+        fig_live_bill.update_layout(
+            barmode="group",
+            title="Monthly bill — before vs after AI Manager optimisation",
+            yaxis_title="Net bill (RM)",
+            yaxis2=dict(title="Savings (RM)", overlaying="y", side="right", showgrid=False),
+            height=360,
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig_live_bill, use_container_width=True)
+
+        # Month selector — detailed breakdown
+        st.markdown("**Detailed breakdown — select a month:**")
+        _sel_month = st.selectbox(
+            "Month", _months_lbl, index=len(_months_lbl) - 1,
+            key="calc_live_month_sel",
+            label_visibility="collapsed",
+        )
+        _sel = next(m for m in _live_bills if m["month"] == _sel_month)
+
+        _dc1, _dc2 = st.columns(2)
+        with _dc1:
+            st.markdown(f"**Before optimisation — {_sel_month}**")
+            _b = _sel["before"]
+            _b_rows = [
+                ("Total kWh",       f"{_b.get('total_kwh', 0):,.1f} kWh"),
+                ("Peak MD",         f"{_b.get('peak_kw_md', 0):.1f} kW"),
+                ("Energy charge",   _fmt_rm(_b.get("energy_rm", 0))),
+                ("MD charge",       _fmt_rm(_b.get("md_rm", 0))),
+                ("ICPT",            _fmt_rm(_b.get("icpt_rm", 0))),
+                ("KWTBB",           _fmt_rm(_b.get("kwtbb_rm", 0))),
+                ("Service tax",     _fmt_rm(_b.get("tax_rm", 0))),
+                ("NEM credit",      f"−{_fmt_rm(_b.get('nem_credit_rm', 0))}"),
+                ("**Net bill**",    f"**{_fmt_rm(_b.get('net_bill_rm', 0))}**"),
+            ]
+            st.table(pd.DataFrame(_b_rows, columns=["Item", "Amount"]))
+
+        with _dc2:
+            st.markdown(f"**After optimisation — {_sel_month}**")
+            _a = _sel["after"]
+            _a_rows = [
+                ("Total kWh",       f"{_a.get('total_kwh', 0):,.1f} kWh"),
+                ("Peak MD",         f"{_a.get('peak_kw_md', 0):.1f} kW"),
+                ("Energy charge",   _fmt_rm(_a.get("energy_rm", 0))),
+                ("MD charge",       _fmt_rm(_a.get("md_rm", 0))),
+                ("ICPT",            _fmt_rm(_a.get("icpt_rm", 0))),
+                ("KWTBB",           _fmt_rm(_a.get("kwtbb_rm", 0))),
+                ("Service tax",     _fmt_rm(_a.get("tax_rm", 0))),
+                ("NEM credit",      f"−{_fmt_rm(_a.get('nem_credit_rm', 0))}"),
+                ("**Net bill**",    f"**{_fmt_rm(_a.get('net_bill_rm', 0))}**"),
+            ]
+            st.table(pd.DataFrame(_a_rows, columns=["Item", "Amount"]))
+
+        _savings_this = _sel["savings_rm"]
+        _savings_pct  = (
+            _savings_this / _sel["before"].get("net_bill_rm", 1) * 100
+            if _sel["before"].get("net_bill_rm", 0) > 0 else 0
+        )
+        st.info(
+            f"**{_sel_month} savings: {_fmt_rm(_savings_this)}**  "
+            f"({_savings_pct:.1f}% reduction)  ·  "
+            f"{_sel['ticks']} intervals captured  "
+            f"({'full month' if _sel['ticks'] >= 1344 else 'partial month — sim may not cover full calendar month'})"
+        )
+
+        # Download live bill CSV
+        _live_bill_rows = []
+        for m in _live_bills:
+            _live_bill_rows.append({
+                "Month":              m["month"],
+                "Ticks":              m["ticks"],
+                "Before kWh":         m["before"].get("total_kwh", 0),
+                "Before Peak kW":     m["before"].get("peak_kw_md", 0),
+                "Before Net Bill":    m["before"].get("net_bill_rm", 0),
+                "After kWh":          m["after"].get("total_kwh", 0),
+                "After Peak kW":      m["after"].get("peak_kw_md", 0),
+                "After Net Bill":     m["after"].get("net_bill_rm", 0),
+                "Savings RM":         m["savings_rm"],
+            })
+        _lb_csv = io.StringIO()
+        pd.DataFrame(_live_bill_rows).to_csv(_lb_csv, index=False)
+        st.download_button(
+            "Download live monthly bill CSV",
+            _lb_csv.getvalue().encode(),
+            "live_monthly_bills.csv", "text/csv",
+        )
+
+    else:
+        st.info(
+            "Live monthly bills appear here automatically each time a full calendar month "
+            "completes in the **🔴 Live Simulation**.  Start the simulation, hit Play, and "
+            "advance until the first month boundary passes — the bill will populate here "
+            "with before/after comparison from the Manager's actual executed decisions."
+        )
+
+    st.divider()
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION B: HISTORICAL BATCH CALCULATION
+    # Calculates from the full uploaded dataset (or Manager historical run).
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader("📊 Historical Batch Calculation")
+    st.caption(
+        "Processes the entire uploaded load profile at once.  "
+        "Run the AI Manager first (Manager tab → Run on full history) to see "
+        "before/after comparison; otherwise uses raw uploaded data."
+    )
 
     if st.session_state.df is None:
         st.warning("Upload a load profile first.")
         st.stop()
 
     if st.session_state.manager_df_optimized is None:
-        st.info("Run the AI Manager first to see before/after bill comparison. "
-                "The calculator will use raw uploaded data for now.")
+        st.info("Run the AI Manager on full history to see before/after comparison.  "
+                "Showing raw uploaded data only for now.")
         df_for_bill  = st.session_state.df
         df_orig_bill = st.session_state.df
         show_comparison = False
@@ -2524,27 +2861,8 @@ with tab4:
         df_orig_bill = st.session_state.manager_df_original
         show_comparison = True
 
-    with st.expander("Tariff & billing settings", expanded=True):
-        c1, c2, c3 = st.columns(3)
-        tariff_options = list(TARIFF_META.keys())
-        _tariff_default = _so("tariff_code", st.session_state.tariff_code)
-        default_idx    = tariff_options.index(_tariff_default) if _tariff_default in tariff_options else 2
-        tariff         = c1.selectbox("Tariff", tariff_options, index=default_idx,
-                                       format_func=lambda t: f"{t} — {TARIFF_META[t]['name']}")
-        icpt_sen       = c2.number_input("ICPT (sen/kWh)", -10.0, 20.0,
-                                          float(_so("icpt_sen", 0.0)), step=0.5,
-                                          help="Positive = surcharge, negative = rebate")
-        nem_rate       = c3.number_input("NEM buyback rate (RM/kWh)", 0.20, 0.50,
-                                          float(_so("nem_rate", 0.31)), step=0.01)
-
-    sched_key = st.session_state.tariff_schedule_key
-    st.caption(
-        f"Schedule in use: **{sched_key}** "
-        f"(toggle in sidebar to switch between July 2025 and legacy rates)."
-    )
-
     try:
-        monthly_stats_opt  = compute_monthly_stats(df_for_bill, schedule_key=sched_key)
+        monthly_stats_opt  = compute_monthly_stats(df_for_bill,  schedule_key=sched_key)
         monthly_stats_orig = compute_monthly_stats(df_orig_bill, schedule_key=sched_key) if show_comparison else monthly_stats_opt
 
         bill_rows_opt, bill_rows_orig = [], []
@@ -2589,43 +2907,49 @@ with tab4:
                     "Net Bill (RM)": round(bill["total_bill"] - nem["nem_credit_rm"], 2),
                 })
 
-        opt_df  = pd.DataFrame(bill_rows_opt)
+        opt_df     = pd.DataFrame(bill_rows_opt)
         total_opt  = opt_df["Net Bill (RM)"].sum()
 
         if show_comparison:
-            orig_df   = pd.DataFrame(bill_rows_orig)
+            orig_df    = pd.DataFrame(bill_rows_orig)
             total_orig = orig_df["Net Bill (RM)"].sum()
             savings    = total_orig - total_opt
 
             c1, c2, c3 = st.columns(3)
             c1.metric("Total Bill (Before)", _fmt_rm(total_orig))
-            c2.metric("Total Bill (After)",  _fmt_rm(total_opt), delta=f"-{_fmt_rm(savings)}", delta_color="inverse")
-            c3.metric("Annual Savings",       _fmt_rm(savings * 12 / max(len(monthly_stats_opt), 1)))
+            c2.metric("Total Bill (After)",  _fmt_rm(total_opt),
+                      delta=f"−{_fmt_rm(savings)}", delta_color="inverse")
+            c3.metric("Annual Savings (est.)",
+                      _fmt_rm(savings * 12 / max(len(monthly_stats_opt), 1)))
 
-            # Chart
-            if len(opt_df) > 0 and "Month" in opt_df.columns:
-                fig = go.Figure()
+            if len(opt_df) > 0:
+                fig_hist_bill = go.Figure()
                 if len(orig_df):
-                    fig.add_trace(go.Bar(name="Before", x=orig_df["Month"], y=orig_df["Net Bill (RM)"],
-                                         marker_color="#d62728"))
-                fig.add_trace(go.Bar(name="After",  x=opt_df["Month"],  y=opt_df["Net Bill (RM)"],
-                                     marker_color="#1f77b4"))
-                fig.update_layout(barmode="group", title="Monthly Bill Comparison",
-                                  yaxis_title="RM", height=350)
-                st.plotly_chart(fig, use_container_width=True)
+                    fig_hist_bill.add_trace(go.Bar(
+                        name="Before", x=orig_df["Month"], y=orig_df["Net Bill (RM)"],
+                        marker_color="#d62728",
+                    ))
+                fig_hist_bill.add_trace(go.Bar(
+                    name="After",  x=opt_df["Month"],  y=opt_df["Net Bill (RM)"],
+                    marker_color="#1f77b4",
+                ))
+                fig_hist_bill.update_layout(
+                    barmode="group", title="Historical monthly bill comparison",
+                    yaxis_title="RM", height=340,
+                )
+                st.plotly_chart(fig_hist_bill, use_container_width=True)
         else:
             c1, c2 = st.columns(2)
             c1.metric("Total Bill (period)", _fmt_rm(total_opt))
             c2.metric("Avg Monthly",         _fmt_rm(total_opt / max(len(opt_df), 1)))
 
-        st.subheader("Monthly Bill Breakdown (After Optimization)")
+        st.subheader("Monthly Bill Breakdown (After Optimisation)")
         st.dataframe(opt_df, use_container_width=True, hide_index=True)
 
-        # Download
         buf = io.StringIO()
         opt_df.to_csv(buf, index=False)
-        st.download_button("Download Bill CSV", buf.getvalue().encode(),
-                           "bill_breakdown.csv", "text/csv")
+        st.download_button("Download historical bill CSV", buf.getvalue().encode(),
+                           "bill_breakdown_historical.csv", "text/csv")
 
         # ─────────────────────────────────────────────────────────────
         # MD TARIFF SENSITIVITY — same period, both schedules
