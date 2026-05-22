@@ -26,6 +26,7 @@ MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
 
 def calculate_solar_sizing(
     roof_area_m2: float,
+    panel_area_m2: float = 2.0,
     panel_wattage_w: int = 415,
     psh: float = 4.5,
 ) -> dict:
@@ -34,6 +35,7 @@ def calculate_solar_sizing(
 
     Args:
         roof_area_m2:    Total roof area in square metres.
+        panel_area_m2:   Physical surface area of one panel in m² (default 2.0 m²).
         panel_wattage_w: Rated output per panel in watts (default 415 W).
         psh:             Peak sun hours per day for the site (Malaysia avg 4.5).
 
@@ -41,7 +43,8 @@ def calculate_solar_sizing(
         dict with all sizing parameters and generation estimates.
     """
     usable_m2 = roof_area_m2 * USABLE_ROOF_FRACTION
-    n_panels = math.floor(usable_m2 / EFFECTIVE_PANEL_AREA_M2)
+    effective_panel_area = panel_area_m2 * _SPACING_FACTOR   # include mounting clearance
+    n_panels = math.floor(usable_m2 / effective_panel_area)
     system_kwp = round(n_panels * panel_wattage_w / 1_000, 2)
 
     annual_kwh = system_kwp * psh * 365 * SYSTEM_DERATE
@@ -57,8 +60,9 @@ def calculate_solar_sizing(
         "usable_area_m2": round(usable_m2, 2),
         "coverage_pct": USABLE_ROOF_FRACTION * 100,
         "n_panels": n_panels,
+        "panel_area_m2": panel_area_m2,
         "panel_wattage_w": panel_wattage_w,
-        "effective_panel_area_m2": round(EFFECTIVE_PANEL_AREA_M2, 2),
+        "effective_panel_area_m2": round(effective_panel_area, 3),
         "system_kwp": system_kwp,
         "psh": psh,
         "system_derate_pct": SYSTEM_DERATE * 100,

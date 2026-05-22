@@ -82,8 +82,11 @@ def calculate_roi(
     cumulative_npv = []
 
     for yr in range(1, SOLAR_LIFE_YEARS + 1):
-        solar_f = (1.0 - SOLAR_DEGRADATION) ** yr
-        batt_f  = (1.0 - BATT_DEGRADATION)  ** min(yr, BATTERY_LIFE_YEARS)
+        solar_f  = (1.0 - SOLAR_DEGRADATION) ** yr
+        # After replacement at year 10 the new battery starts at age 0,
+        # so age resets: years 1-10 use natural age, years 11-25 use age from replacement.
+        batt_age = yr if yr <= BATTERY_LIFE_YEARS else yr - BATTERY_LIFE_YEARS
+        batt_f   = (1.0 - BATT_DEGRADATION) ** batt_age
 
         yr_benefit = (
             self_consumed_kwh  * solar_f * ENERGY_RATE_C1 * TAX_MULTIPLIER
@@ -105,6 +108,12 @@ def calculate_roi(
 
     irr = _irr(total_capex, cashflows)
 
+    # ── ROI % (undiscounted 25-yr cashflows / initial CAPEX) ─────────────────
+    # ROI > 200% means the system returns more than 2× the initial investment
+    # in net savings over 25 years (after battery replacement at year 10).
+    total_25yr_cashflows = sum(cashflows)
+    roi_pct = round(total_25yr_cashflows / total_capex * 100, 1) if total_capex > 0 else None
+
     # ── CO₂ offset ────────────────────────────────────────────────────────────
     co2_offset = annual_gen_kwh * GRID_EMISSION_FACTOR
 
@@ -123,6 +132,8 @@ def calculate_roi(
         "simple_payback_years":    round(simple_payback, 1),
         "npv_25yr_rm":             round(npv),
         "irr_pct":                 round(irr * 100, 1) if irr is not None else None,
+        "roi_pct":                 roi_pct,
+        "total_25yr_cashflows":    round(total_25yr_cashflows),
         "cumulative_npv":          cumulative_npv,
         # Generation details
         "annual_gen_kwh":          round(annual_gen_kwh),

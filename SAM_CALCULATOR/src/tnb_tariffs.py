@@ -1,15 +1,19 @@
 """
 TNB Tariff Engine — Peninsular Malaysia
-Tariff rates: official TNB schedule (revised 2014, updated 2022).
+Tariff rates: official TNB schedule (revised 2014, updated July 2025).
 Covers: Tariff A (domestic tiered), B, C1, C2, D, E1, E2.
-Includes: ICPT, KWTBB (1.6%), Service Tax (6%), NEM solar credit.
+Includes: ICPT, KWTBB (1.6%), Service Tax (8%), NEM solar credit.
+
+MD charge rates updated July 2025: RM 97.06/kW for C1, C2, D, E1, E2.
+MD is measured as the highest 30-min average kW reading in the billing month.
 
 Voltage tiers (used for auto-detection):
-  Low Voltage  (LV)  240 V / 415 V   → Tariff A, B         peak demand < 25 kW
-  Medium Voltage(MV) 6.6 kV / 11 kV / 22 kV → Tariff C1, C2  25–999 kW
-  High Voltage (HV)  33 kV / 132 kV  → Tariff D, E1, E2   ≥ 1,000 kW
+  Low Voltage  (LV)  240 V / 415 V              → Tariff A, B       peak demand < 25 kW
+  Medium Voltage(MV) 6.6 kV / 11 kV / 22 kV    → Tariff C1, C2     25 – 999 kW
+  High Voltage (HV)  33 kV / 132 kV             → Tariff D, E1, E2  ≥ 1,000 kW
 """
 from __future__ import annotations
+import datetime
 import pandas as pd
 import numpy as np
 from typing import Literal
@@ -35,33 +39,33 @@ TARIFF_B_MIN    = 7.20
 
 # Tariff C1 — Medium Voltage General
 TARIFF_C1_ENERGY = 0.365
-TARIFF_C1_MD     = 30.30
+TARIFF_C1_MD     = 97.06   # July 2025 revised rate (was 30.30)
 TARIFF_C1_MIN    = 600.00
 
 # Tariff C2 — Medium Voltage Time-of-Use (08:00–22:00 Mon–Sat = peak)
 TARIFF_C2_PEAK    = 0.365
 TARIFF_C2_OFFPEAK = 0.219
-TARIFF_C2_MD      = 30.30
+TARIFF_C2_MD      = 97.06   # July 2025 revised rate (was 30.30)
 TARIFF_C2_MIN     = 600.00
 
 # Tariff D — High Voltage General
 TARIFF_D_ENERGY = 0.337
-TARIFF_D_MD     = 29.60
+TARIFF_D_MD     = 97.06   # July 2025 revised rate (was 29.60)
 TARIFF_D_MIN    = 600.00
 
 # Tariff E1 — High Voltage Peak / Off-Peak
 TARIFF_E1_PEAK    = 0.337
 TARIFF_E1_OFFPEAK = 0.202
-TARIFF_E1_MD      = 29.60
+TARIFF_E1_MD      = 97.06   # July 2025 revised rate (was 29.60)
 TARIFF_E1_MIN     = 600.00
 
 # Tariff E2 — High Voltage TOU (MD ≥ 1,500 kW, same rates as E1 in 2024)
 TARIFF_E2_PEAK    = 0.337
 TARIFF_E2_OFFPEAK = 0.202
-TARIFF_E2_MD      = 29.60
+TARIFF_E2_MD      = 97.06   # July 2025 revised rate (was 29.60)
 TARIFF_E2_MIN     = 600.00
 
-SERVICE_TAX_RATE = 0.06    # 6 % on (energy + MD + KWTBB) for non-domestic
+SERVICE_TAX_RATE = 0.08    # 8 % on (energy + MD + KWTBB) for non-domestic (raised from 6% in March 2024)
 KWTBB_RATE       = 0.016   # 1.6 % Kumpulan Wang Tenaga Boleh Baharu (non-domestic)
 
 # NEM buyback default — TNB NEM 3.0 (≤ 72 kWp, residential/commercial)
@@ -137,11 +141,117 @@ _MIN_CHARGES: dict[str, float] = {
 }
 
 
+# ─── Malaysian public holidays (national, Peninsular Malaysia, 2020–2027) ─────
+# Hari Raya, CNY, and other lunar holidays use confirmed/projected dates.
+# Off-peak on TOU tariffs per TNB schedule.
+_MY_PUBLIC_HOLIDAYS: frozenset = frozenset({
+    # 2020
+    datetime.date(2020, 1, 1),   datetime.date(2020, 1, 25),  datetime.date(2020, 1, 26),
+    datetime.date(2020, 1, 27),  # CNY (Day 2 fell on Sun; Mon substitute)
+    datetime.date(2020, 5, 1),   datetime.date(2020, 5, 7),
+    datetime.date(2020, 5, 24),  datetime.date(2020, 5, 25),  # Hari Raya Aidilfitri
+    datetime.date(2020, 6, 1),   # Yang DiPertuan Agong Birthday (1st Mon Jun)
+    datetime.date(2020, 7, 31),  # Hari Raya Aidiladha
+    datetime.date(2020, 8, 20),  # Awal Muharram 1442 AH
+    datetime.date(2020, 8, 31),  datetime.date(2020, 9, 16),
+    datetime.date(2020, 10, 29), # Maulidur Rasul
+    datetime.date(2020, 11, 14), datetime.date(2020, 12, 25),
+    # 2021
+    datetime.date(2021, 1, 1),
+    datetime.date(2021, 2, 12),  datetime.date(2021, 2, 13),  # CNY
+    datetime.date(2021, 5, 1),
+    datetime.date(2021, 5, 13),  datetime.date(2021, 5, 14),  # Hari Raya Aidilfitri
+    datetime.date(2021, 5, 26),  # Wesak
+    datetime.date(2021, 6, 7),   # Yang DiPertuan Agong Birthday
+    datetime.date(2021, 7, 20),  # Hari Raya Aidiladha
+    datetime.date(2021, 8, 9),   # Awal Muharram 1443 AH
+    datetime.date(2021, 8, 31),  datetime.date(2021, 9, 16),
+    datetime.date(2021, 10, 19), # Maulidur Rasul
+    datetime.date(2021, 11, 4),  datetime.date(2021, 12, 25),
+    # 2022
+    datetime.date(2022, 1, 1),
+    datetime.date(2022, 2, 1),   datetime.date(2022, 2, 2),   # CNY
+    datetime.date(2022, 5, 1),
+    datetime.date(2022, 5, 2),   datetime.date(2022, 5, 3),   # Hari Raya Aidilfitri
+    datetime.date(2022, 5, 15),  # Wesak
+    datetime.date(2022, 6, 6),   # Yang DiPertuan Agong Birthday
+    datetime.date(2022, 7, 9),   # Hari Raya Aidiladha
+    datetime.date(2022, 7, 30),  # Awal Muharram 1444 AH
+    datetime.date(2022, 8, 31),  datetime.date(2022, 9, 16),
+    datetime.date(2022, 10, 8),  # Maulidur Rasul
+    datetime.date(2022, 10, 24), datetime.date(2022, 12, 25),
+    # 2023
+    datetime.date(2023, 1, 1),
+    datetime.date(2023, 1, 22),  datetime.date(2023, 1, 23),  # CNY
+    datetime.date(2023, 1, 24),  # CNY substitute (Day 1 fell on Sun)
+    datetime.date(2023, 4, 21),  datetime.date(2023, 4, 22),  # Hari Raya Aidilfitri
+    datetime.date(2023, 5, 1),   datetime.date(2023, 5, 4),   # Wesak
+    datetime.date(2023, 6, 5),   # Yang DiPertuan Agong Birthday
+    datetime.date(2023, 6, 28),  # Hari Raya Aidiladha
+    datetime.date(2023, 7, 19),  # Awal Muharram 1445 AH
+    datetime.date(2023, 8, 31),  datetime.date(2023, 9, 16),
+    datetime.date(2023, 9, 27),  # Maulidur Rasul
+    datetime.date(2023, 11, 12), datetime.date(2023, 12, 25),
+    # 2024
+    datetime.date(2024, 1, 1),
+    datetime.date(2024, 2, 10),  datetime.date(2024, 2, 11),  # CNY
+    datetime.date(2024, 2, 12),  # CNY substitute (Day 2 fell on Sun)
+    datetime.date(2024, 4, 10),  datetime.date(2024, 4, 11),  # Hari Raya Aidilfitri
+    datetime.date(2024, 5, 1),   datetime.date(2024, 5, 22),  # Wesak
+    datetime.date(2024, 6, 3),   # Yang DiPertuan Agong Birthday
+    datetime.date(2024, 6, 17),  # Hari Raya Aidiladha
+    datetime.date(2024, 7, 7),   # Awal Muharram 1446 AH
+    datetime.date(2024, 8, 31),
+    datetime.date(2024, 9, 16),  # Malaysia Day & Maulidur Rasul (same date in 2024)
+    datetime.date(2024, 10, 31), datetime.date(2024, 12, 25),
+    # 2025
+    datetime.date(2025, 1, 1),
+    datetime.date(2025, 1, 29),  datetime.date(2025, 1, 30),  # CNY
+    datetime.date(2025, 3, 31),  datetime.date(2025, 4, 1),   # Hari Raya Aidilfitri
+    datetime.date(2025, 5, 1),   datetime.date(2025, 5, 12),  # Wesak
+    datetime.date(2025, 6, 2),   # Yang DiPertuan Agong Birthday
+    datetime.date(2025, 6, 6),   # Hari Raya Aidiladha
+    datetime.date(2025, 6, 26),  # Awal Muharram 1447 AH
+    datetime.date(2025, 8, 31),
+    datetime.date(2025, 9, 5),   # Maulidur Rasul
+    datetime.date(2025, 9, 16),
+    datetime.date(2025, 10, 20), datetime.date(2025, 12, 25),
+    # 2026
+    datetime.date(2026, 1, 1),
+    datetime.date(2026, 2, 17),  datetime.date(2026, 2, 18),  # CNY
+    datetime.date(2026, 3, 20),  datetime.date(2026, 3, 21),  # Hari Raya Aidilfitri
+    datetime.date(2026, 5, 1),
+    datetime.date(2026, 5, 27),  # Hari Raya Aidiladha
+    datetime.date(2026, 5, 31),  # Wesak (approx)
+    datetime.date(2026, 6, 1),   # Yang DiPertuan Agong Birthday
+    datetime.date(2026, 6, 16),  # Awal Muharram 1448 AH (approx)
+    datetime.date(2026, 8, 25),  # Maulidur Rasul (approx)
+    datetime.date(2026, 8, 31),  datetime.date(2026, 9, 16),
+    datetime.date(2026, 11, 8),  # Deepavali (approx)
+    datetime.date(2026, 12, 25),
+    # 2027
+    datetime.date(2027, 1, 1),
+    datetime.date(2027, 2, 6),   datetime.date(2027, 2, 7),   # CNY
+    datetime.date(2027, 3, 10),  datetime.date(2027, 3, 11),  # Hari Raya Aidilfitri
+    datetime.date(2027, 5, 1),
+    datetime.date(2027, 5, 17),  # Hari Raya Aidiladha
+    datetime.date(2027, 5, 21),  # Wesak (approx)
+    datetime.date(2027, 6, 5),   # Awal Muharram 1449 AH (approx)
+    datetime.date(2027, 6, 7),   # Yang DiPertuan Agong Birthday (1st Mon Jun)
+    datetime.date(2027, 8, 14),  # Maulidur Rasul (approx)
+    datetime.date(2027, 8, 31),  datetime.date(2027, 9, 16),
+    datetime.date(2027, 10, 28), # Deepavali (approx)
+    datetime.date(2027, 12, 25),
+})
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def is_peak_hour(ts: pd.Timestamp) -> bool:
     """Peak window = 08:00–22:00, Monday–Saturday. Sunday & PH = off-peak."""
     if ts.dayofweek == 6:   # Sunday
+        return False
+    if ts.date() in _MY_PUBLIC_HOLIDAYS:
         return False
     return 8 <= ts.hour < 22
 
@@ -165,6 +275,7 @@ def calculate_bill(
     icpt_sen_per_kwh: float = 0.0,
     apply_service_tax: bool = True,
     apply_kwtbb: bool = True,
+    avg_pf: float = 1.0,
 ) -> dict:
     """
     Calculate a full TNB bill for one billing month.
@@ -185,10 +296,13 @@ def calculate_bill(
         "peak_kwh": peak_kwh,
         "offpeak_kwh": offpeak_kwh,
         "max_demand_kw": max_demand_kw,
+        "avg_pf": avg_pf,
         "energy_charge": 0.0,
         "md_charge": 0.0,
         "icpt_charge": 0.0,
         "kwtbb_charge": 0.0,
+        "pf_surcharge": 0.0,
+        "pf_surcharge_pct": 0.0,
         "service_tax": 0.0,
         "subtotal_pretax": 0.0,
         "minimum_charge_applied": False,
@@ -267,16 +381,33 @@ def calculate_bill(
     if apply_kwtbb and not is_domestic:
         result["kwtbb_charge"] = round(result["energy_charge"] * KWTBB_RATE, 2)
 
+    # ── Power Factor Surcharge (MD tariffs only) ──────────────────────────────
+    if TARIFF_META[tariff]["has_md"]:
+        avg_pf_clamped = max(0.0, min(1.0, avg_pf))
+        avg_pf_2dp = round(avg_pf_clamped, 2)
+        if avg_pf_2dp < 0.85:
+            pf_units = round((0.85 - avg_pf_2dp) * 100)
+            if pf_units > 0:
+                pf_base = result["energy_charge"] + result["md_charge"] + result["kwtbb_charge"]
+                result["pf_surcharge"] = round(pf_base * pf_units * 0.015, 2)
+                result["pf_surcharge_pct"] = round(pf_units * 1.5, 1)
+                result["notes"].append(
+                    f"PF Surcharge: avg PF {avg_pf_clamped:.4f} → {pf_units} unit(s) below 0.85 "
+                    f"→ {pf_units * 1.5:.1f}% of (energy + MD + KWTBB)."
+                )
+
     # ── Service Tax (non-domestic only) ───────────────────────────────────────
     if apply_service_tax and not is_domestic:
-        taxable = result["energy_charge"] + result["md_charge"] + result["kwtbb_charge"]
+        taxable = (result["energy_charge"] + result["md_charge"] +
+                   result["kwtbb_charge"] + result["pf_surcharge"])
         result["service_tax"] = round(taxable * SERVICE_TAX_RATE, 2)
 
     # ── Subtotal & minimum charge ──────────────────────────────────────────────
     raw = (result["energy_charge"] + result["md_charge"] + result["icpt_charge"] +
-           result["kwtbb_charge"]  + result["service_tax"])
+           result["kwtbb_charge"]  + result["pf_surcharge"] + result["service_tax"])
     result["subtotal_pretax"] = round(
-        result["energy_charge"] + result["md_charge"] + result["icpt_charge"], 2)
+        result["energy_charge"] + result["md_charge"] + result["icpt_charge"] +
+        result["kwtbb_charge"]  + result["pf_surcharge"], 2)
 
     min_c = _MIN_CHARGES[tariff]
     if raw < min_c:
@@ -413,23 +544,29 @@ def compute_monthly_stats(df: pd.DataFrame, interval_minutes: int = 30) -> pd.Da
     """
     Aggregate a load profile into per-month billing stats.
     Returns columns: month, total_kwh, peak_kwh, offpeak_kwh,
-                     max_demand_kw, export_kwh
+                     max_demand_kw, export_kwh, avg_pf
+    avg_pf uses the TNB meter method: total_kWh / sqrt(total_kWh^2 + total_kVARh^2).
     """
     kfac = interval_minutes / 60.0
     df = df.copy()
-    df["month"]      = df["timestamp"].dt.to_period("M")
-    df["is_peak"]    = df["timestamp"].apply(is_peak_hour)
-    df["kwh"]        = df["kw_import"] * kfac
+    df["month"]         = df["timestamp"].dt.to_period("M")
+    df["is_peak"]       = df["timestamp"].apply(is_peak_hour)
+    df["kwh"]           = df["kw_import"] * kfac
     df["export_kwh_pt"] = df["kw_export"] * kfac
 
-    stats = df.groupby("month", group_keys=False).apply(
-        lambda g: pd.Series({
-            "total_kwh":    round(float(g["kwh"].sum()), 3),
-            "peak_kwh":     round(float(g.loc[g["is_peak"],  "kwh"].sum()), 3),
-            "offpeak_kwh":  round(float(g.loc[~g["is_peak"], "kwh"].sum()), 3),
+    def _month_stats(g: pd.DataFrame) -> pd.Series:
+        total_kwh_m  = float(g["kwh"].sum())
+        total_kvarh  = float((g["kvar_import"] * kfac).sum()) if "kvar_import" in g.columns else 0.0
+        total_kvah   = (total_kwh_m ** 2 + total_kvarh ** 2) ** 0.5
+        pf = round(total_kwh_m / total_kvah, 4) if total_kvah > 0 else 1.0
+        return pd.Series({
+            "total_kwh":     round(total_kwh_m, 3),
+            "peak_kwh":      round(float(g.loc[g["is_peak"],  "kwh"].sum()), 3),
+            "offpeak_kwh":   round(float(g.loc[~g["is_peak"], "kwh"].sum()), 3),
             "max_demand_kw": round(float(g["kw_import"].max()), 3),
-            "export_kwh":   round(float(g["export_kwh_pt"].sum()), 3),
+            "export_kwh":    round(float(g["export_kwh_pt"].sum()), 3),
+            "avg_pf":        pf,
         })
-    ).reset_index()
 
+    stats = df.groupby("month", group_keys=False).apply(_month_stats).reset_index()
     return stats
