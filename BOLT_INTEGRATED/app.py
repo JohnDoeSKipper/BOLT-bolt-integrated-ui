@@ -105,6 +105,11 @@ for key, default in [
     # Accumulates the FIRST row of each tick's Manager output — the decision
     # actually executed on the live actual reading, not the forecast plan.
     ("executed_ticks", []),
+    # User scenario factor — scales the forecast for a known operational event.
+    # Persisted across reruns so the Manager always reads the active factor.
+    ("forecast_user_factor",     1.0),
+    ("forecast_user_confidence", 0.80),
+    ("forecast_factor_steps",    48),
     # Tracks which site_id the auto historical Manager run was last completed
     # for. Reset to None by _invalidate_downstream() so a new data upload or
     # site switch triggers a fresh auto-run.
@@ -326,6 +331,24 @@ def _run_manager_on_live_forecast() -> list | None:
         except Exception:
             pass    # fall back to forecast-only if shape mismatch
 
+    # Apply user scenario factor to forecast rows only.
+    # Row 0 is the actual reading — never scaled.
+    # Rows 1..n_steps are the forecast — scaled by the user's factor so the
+    # Manager plans battery dispatch for the expected operational change.
+    _u_factor = float(st.session_state.get("forecast_user_factor", 1.0))
+    _u_steps  = int(st.session_state.get("forecast_factor_steps", 48))
+    if abs(_u_factor - 1.0) > 1e-3 and len(mgr_df) > 1:
+        _end = min(1 + _u_steps, len(mgr_df))
+        for _col in ("kw_import", "kw_net", "kvar_import", "kvar_net"):
+            if _col in mgr_df.columns:
+                _v = mgr_df[_col].values.astype(float).copy()
+                _v[1:_end] = _v[1:_end] * _u_factor
+                mgr_df[_col] = _v
+        if "kw_net" in mgr_df.columns and "kvar_net" in mgr_df.columns:
+            mgr_df["kva"] = np.sqrt(
+                mgr_df["kw_net"].values ** 2 + mgr_df["kvar_net"].values ** 2
+            )
+
     # Build loads dict from profile, then layer Site Setup overrides on top
     loads = profile_loads_for_manager(profile)
     ov = _site_overrides_for(profile.id)
@@ -544,6 +567,50 @@ def _ensure_historical_manager() -> bool:
         # Silent failure — user can always run manually from the Manager tab.
         st.session_state["_auto_manager_site"] = None  # allow retry on next render
         return False
+
+
+def _apply_user_factor(
+    median: np.ndarray,
+    p10: np.ndarray,
+    p90: np.ndarray,
+    factor: float,
+    confidence: float,
+    n_steps: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Scale the first `n_steps` of a forecast by `factor`, widening the
+    uncertainty bands to reflect the user's confidence in their estimate.
+
+    Engineering rationale
+    ─────────────────────
+    A user-supplied factor ("big order → ×1.5") is an operational judgement,
+    not a statistical guarantee.  The estimation error (1 − confidence)
+    adds to the existing model uncertainty so the Manager plans
+    conservatively rather than treating the factor as exact.
+
+    Band widening formula:
+        extra[i] = adj_median[i] × (1 − confidence) × |factor − 1|
+        adj_p90[i] += extra[i]
+        adj_p10[i]  = max(0, adj_p10[i] − extra[i])
+
+    At confidence = 100 %: bands scale proportionally, no additional width.
+    At confidence =  50 %: 50 % of the scaling delta added to each side.
+    """
+    n          = min(int(n_steps), len(median))
+    adj_median = median.copy().astype(float)
+    adj_p10    = p10.copy().astype(float)
+    adj_p90    = p90.copy().astype(float)
+
+    adj_median[:n] = median[:n] * factor
+    adj_p10[:n]    = p10[:n]   * factor
+    adj_p90[:n]    = p90[:n]   * factor
+
+    # Uncertainty widening from estimation error
+    extra          = adj_median[:n] * (1.0 - confidence) * abs(factor - 1.0)
+    adj_p90[:n]   += extra
+    adj_p10[:n]    = np.maximum(0.0, adj_p10[:n] - extra)
+
+    return adj_median, adj_p10, adj_p90
 
 
 def _collect_assumptions() -> list[dict]:
@@ -1597,6 +1664,179 @@ with tab2:
                 file_name="forecast_output.csv",
                 mime="text/csv",
             )
+
+            # ── SCENARIO ADJUSTMENT FACTOR ────────────────────────────────
+            st.divider()
+            st.subheader("🎛️ Scenario Adjustment Factor")
+            st.caption(
+                "Apply an operational scaling factor to account for a known upcoming "
+                "event that the model cannot see (e.g. a large production order, a "
+                "partial closure, a holiday).  The adjusted forecast is shown visually "
+                "and fed to the live Manager so battery dispatch is planned for the "
+                "expected conditions, not just the historical pattern."
+            )
+
+            _fac_c1, _fac_c2, _fac_c3 = st.columns(3)
+
+            with _fac_c1:
+                _user_factor = st.number_input(
+                    "Scaling factor",
+                    min_value=0.10, max_value=5.00,
+                    value=float(st.session_state.get("forecast_user_factor", 1.0)),
+                    step=0.05, format="%.2f",
+                    help=(
+                        "1.00 = no adjustment (model used as-is).\n"
+                        "1.50 = expect 50% MORE load (big order, event, extra shift).\n"
+                        "0.30 = expect 70% LESS load (closure, holiday, equipment off)."
+                    ),
+                    key="pred_user_factor_input",
+                )
+
+            _horizon_opts = {
+                "2 h  (4 steps)":  4,
+                "4 h  (8 steps)":  8,
+                "8 h  (16 steps)": 16,
+                "12 h (24 steps)": 24,
+                "24 h (48 steps)": 48,
+            }
+            with _fac_c2:
+                _horizon_label = st.selectbox(
+                    "Applies to next",
+                    list(_horizon_opts.keys()),
+                    index=4,
+                    key="pred_factor_horizon_sel",
+                    help="How far ahead the factor is applied. Beyond this window the model's raw forecast resumes.",
+                )
+            _n_steps_fac = _horizon_opts[_horizon_label]
+
+            with _fac_c3:
+                _user_conf = st.slider(
+                    "Confidence in estimate", 50, 100,
+                    int(st.session_state.get("forecast_user_confidence", 0.80) * 100),
+                    step=5, format="%d%%",
+                    key="pred_user_confidence_sl",
+                    help=(
+                        "How certain are you in the factor?\n"
+                        "100% = certain → bands scale proportionally only.\n"
+                        "50%  = uncertain → bands widen significantly to cover estimation error."
+                    ),
+                ) / 100.0
+
+            # Persist to session state for Manager propagation
+            st.session_state["forecast_user_factor"]     = _user_factor
+            st.session_state["forecast_user_confidence"] = _user_conf
+            st.session_state["forecast_factor_steps"]    = _n_steps_fac
+
+            if abs(_user_factor - 1.0) < 0.01:
+                st.caption(
+                    "Factor = 1.00 — no adjustment.  "
+                    "Raw model forecast used for display and Manager dispatch."
+                )
+            else:
+                _change_pct = abs(_user_factor - 1.0) * 100
+                if _user_factor > 1.0:
+                    st.info(
+                        f"**Load scaled UP by {_change_pct:.0f}%** for the next "
+                        f"{_horizon_label.strip()}.  "
+                        "Typical: large production order, additional shift, onsite event.  "
+                        f"Manager will pre-charge the battery more aggressively to handle "
+                        "the higher expected peak."
+                    )
+                else:
+                    st.warning(
+                        f"**Load scaled DOWN by {_change_pct:.0f}%** for the next "
+                        f"{_horizon_label.strip()}.  "
+                        "Typical: partial or full site closure, public holiday, "
+                        "major equipment shutdown.  "
+                        "Manager will hold back on charging to avoid over-reserving capacity."
+                    )
+
+                # Compute adjusted arrays
+                _adj_median, _adj_p10, _adj_p90 = _apply_user_factor(
+                    fr.median, fr.p10, fr.p90,
+                    _user_factor, _user_conf, _n_steps_fac,
+                )
+
+                # Adjusted forecast chart — raw as dashed grey reference
+                _ts_list = list(fr.timestamps)
+                _fig_adj = go.Figure()
+                _fig_adj.add_trace(go.Scatter(
+                    x=hist_tail["timestamp"], y=hist_tail["kw_import"],
+                    mode="lines", name="Historical",
+                    line=dict(color="#6b7280", width=1.5),
+                ))
+                _fig_adj.add_trace(go.Scatter(
+                    x=_ts_list, y=fr.median,
+                    mode="lines", name="Raw model forecast (reference)",
+                    line=dict(color="#9ca3af", width=1.5, dash="dot"),
+                ))
+                _fig_adj.add_trace(go.Scatter(
+                    x=_ts_list + _ts_list[::-1],
+                    y=list(_adj_p90) + list(_adj_p10[::-1]),
+                    fill="toself",
+                    fillcolor=(
+                        "rgba(239,68,68,0.13)" if _user_factor > 1.0
+                        else "rgba(59,130,246,0.13)"
+                    ),
+                    line=dict(color="rgba(255,255,255,0)"),
+                    name="Adjusted P10–P90 band",
+                ))
+                _fig_adj.add_trace(go.Scatter(
+                    x=_ts_list, y=_adj_median,
+                    mode="lines",
+                    name=f"Adjusted forecast (×{_user_factor:.2f}, {_user_conf*100:.0f}% conf.)",
+                    line=dict(
+                        color="#ef4444" if _user_factor > 1.0 else "#3b82f6",
+                        width=2.5,
+                    ),
+                ))
+                # Mark the end of the factor window if not full horizon
+                if _n_steps_fac < len(_ts_list):
+                    _win_end_ts = _ts_list[_n_steps_fac - 1]
+                    _y_top = float(_adj_p90.max()) * 1.05
+                    _fig_adj.add_trace(go.Scatter(
+                        x=[_win_end_ts, _win_end_ts], y=[0, _y_top],
+                        mode="lines", name="Factor window end",
+                        line=dict(color="#f59e0b", width=2, dash="dash"),
+                        hoverinfo="skip",
+                    ))
+                _fig_adj.update_layout(
+                    title=(
+                        f"Adjusted forecast — ×{_user_factor:.2f} for next "
+                        f"{_horizon_label.strip()}  |  "
+                        f"confidence {_user_conf*100:.0f}%"
+                    ),
+                    xaxis_title="Time", yaxis_title="kW",
+                    hovermode="x unified", height=420,
+                    legend=dict(orientation="h", yanchor="bottom", y=1.02),
+                )
+                st.plotly_chart(_fig_adj, use_container_width=True)
+
+                # Comparison summary
+                _sc1, _sc2, _sc3, _sc4 = st.columns(4)
+                _raw_pk  = float(fr.median.max())
+                _adj_pk  = float(_adj_median.max())
+                _raw_avg = float(fr.median.mean())
+                _adj_avg = float(_adj_median.mean())
+                _sc1.metric("Raw peak",     f"{_raw_pk:.1f} kW")
+                _sc2.metric("Adjusted peak", f"{_adj_pk:.1f} kW",
+                            delta=f"{_adj_pk - _raw_pk:+.1f} kW", delta_color="off")
+                _sc3.metric("Raw mean",     f"{_raw_avg:.1f} kW")
+                _sc4.metric("Adjusted mean", f"{_adj_avg:.1f} kW",
+                            delta=f"{_adj_avg - _raw_avg:+.1f} kW", delta_color="off")
+
+                _conf_note = (
+                    "Uncertainty bands are widened to cover your estimation error "
+                    f"(confidence {_user_conf*100:.0f}%)."
+                    if _user_conf < 1.0 else
+                    "Bands scale proportionally (100% confidence → no additional widening)."
+                )
+                st.caption(
+                    f"**Manager dispatch**: the live Manager sees the adjusted load "
+                    f"for the next {_horizon_label.strip()} and plans battery "
+                    f"{'pre-charging' if _user_factor > 1.0 else 'hold-back'} accordingly.  "
+                    f"{_conf_note}"
+                )
 
         except Exception as e:
             st.error(f"Forecast failed: {e}")
