@@ -174,18 +174,28 @@ class DirectMultiStepForecaster:
     #                        DATA PREPARATION
     # ===================================================================
     def _prepare_supervised(self, df: pd.DataFrame, h: int):
-        """Build (X_train, y_train, X_val, y_val) for horizon h."""
+        """Legacy: build the feature matrix AND extract (X_tr, y_tr, X_va, y_va).
+
+        Kept for callers that build features once per call.  fit() and update()
+        now use _prepare_supervised_cached to avoid re-running build_feature_matrix
+        24 times per training pass (it was 30–60 % of training wall-time before).
+        """
         feat_df, feature_cols = build_feature_matrix(
             df, capacity_kwp=self.capacity_kwp, target="kw_import",
             lat=self.lat, lon=self.lon, timezone=self.timezone,
         )
         self.feature_cols = feature_cols
+        return self._prepare_supervised_cached(feat_df, h)
 
+    def _prepare_supervised_cached(self, feat_df: pd.DataFrame, h: int):
+        """Slice a pre-built feature matrix into (X_tr, y_tr, X_va, y_va) for
+        horizon h.  Only the shift mask varies per horizon — the X columns
+        are identical, so we keep them in numpy once and re-mask cheaply.
+        """
         y_h = feat_df["kw_import"].shift(-h)
         valid = ~y_h.isna()
-        X_full = feat_df[feature_cols][valid].values
+        X_full = feat_df[self.feature_cols][valid].values
         y_full = y_h[valid].values
-
         split = int(len(X_full) * 0.8)
         return X_full[:split], y_full[:split], X_full[split:], y_full[split:]
 
@@ -334,8 +344,14 @@ class DirectMultiStepForecaster:
     # ===================================================================
     #                         FROM-SCRATCH FIT
     # ===================================================================
-    def fit(self, df: pd.DataFrame, verbose: bool = False) -> dict:
-        """Train all (horizon × quantile) models from scratch."""
+    def fit(self, df: pd.DataFrame, verbose: bool = False,
+             progress_callback=None) -> dict:
+        """Train all (horizon × quantile) models from scratch.
+
+        progress_callback(int_i, int_total, int_h) — optional.  Called after
+        each horizon completes.  Used by the Streamlit Predictor tab to
+        animate a progress bar; pass None to suppress.
+        """
         self.history = df.copy().sort_values("timestamp").reset_index(drop=True)
         self.boosters.clear()
 
@@ -350,9 +366,19 @@ class DirectMultiStepForecaster:
         # Reset baselines on a fresh fit
         self.baselines = {}
 
+        # PERF FIX 2026-05-22: build feature matrix ONCE for the full
+        # history, not 24× per fit() (was 30-60 % of training wall-time).
+        # _prepare_supervised_cached slices it cheaply per horizon.
+        feat_df, feature_cols = build_feature_matrix(
+            self.history, capacity_kwp=self.capacity_kwp, target="kw_import",
+            lat=self.lat, lon=self.lon, timezone=self.timezone,
+        )
+        self.feature_cols = feature_cols
+
         per_horizon = {}
-        for h in self.horizons:
-            X_tr, y_tr, X_va, y_va = self._prepare_supervised(self.history, h)
+        n_h = len(self.horizons)
+        for i, h in enumerate(self.horizons):
+            X_tr, y_tr, X_va, y_va = self._prepare_supervised_cached(feat_df, h)
 
             # Linear baseline (Ridge on additive features) — applied ONLY
             # for long horizons (h >= baseline_min_horizon) where the
@@ -413,6 +439,11 @@ class DirectMultiStepForecaster:
             }
             if verbose:
                 print(f"  h={h:2d}: MAE={mae:6.1f} kW  MAPE={mape:5.2f}%  Pinball={per_horizon[h]['pinball']:6.2f}")
+            if progress_callback is not None:
+                try:
+                    progress_callback(i + 1, n_h, h)
+                except Exception:
+                    pass    # never let UI code break training
 
         self.metrics = {"per_horizon": per_horizon}
         self.n_train_rows = len(self.history)
@@ -441,6 +472,7 @@ class DirectMultiStepForecaster:
         lookback_days: float = 30.0,
         recency_half_life_days: float = 7.0,
         verbose: bool = False,
+        progress_callback=None,
     ) -> dict:
         """
         Recency-weighted warm-start update.
@@ -488,19 +520,23 @@ class DirectMultiStepForecaster:
         raw_weights = np.exp(raw_positions * np.log(2) / half_life_rows)
         raw_weights = (raw_weights / raw_weights.mean()).clip(0.05, 20.0)
 
+        # PERF FIX 2026-05-22: build feature matrix ONCE for the warm-start
+        # window, not 24× per update().  Same as fit().
+        feat_df, feature_cols = build_feature_matrix(
+            training_df, capacity_kwp=self.capacity_kwp, target="kw_import",
+            lat=self.lat, lon=self.lon, timezone=self.timezone,
+        )
+        self.feature_cols = feature_cols
+
         per_horizon = {}
-        for h in self.horizons:
-            X_tr, y_tr, X_va, y_va = self._prepare_supervised(training_df, h)
+        n_h = len(self.horizons)
+        for i, h in enumerate(self.horizons):
+            X_tr, y_tr, X_va, y_va = self._prepare_supervised_cached(feat_df, h)
             if len(X_tr) < 10:
                 continue
 
-            # _prepare_supervised returns the first 80% of valid rows as X_tr.
             # Map raw_weights onto the valid (non-NaN) rows, then take the
             # first 80% to align with X_tr.
-            feat_df, _ = build_feature_matrix(
-                training_df, capacity_kwp=self.capacity_kwp, target="kw_import",
-                lat=self.lat, lon=self.lon, timezone=self.timezone,
-            )
             y_h = feat_df["kw_import"].shift(-h)
             valid_mask = ~y_h.isna()
             valid_indices = np.where(valid_mask)[0]
@@ -560,6 +596,11 @@ class DirectMultiStepForecaster:
             if verbose:
                 print(f"  h={h:2d}: MAE={mae:6.1f}  MAPE={mape:5.2f}%  "
                       f"(recency-weighted +{n_rounds} rounds, window={len(training_df)} rows)")
+            if progress_callback is not None:
+                try:
+                    progress_callback(i + 1, n_h, h)
+                except Exception:
+                    pass
 
         self.metrics = {"per_horizon": per_horizon}
         self.n_train_rows = len(combined)

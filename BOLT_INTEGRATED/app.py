@@ -944,19 +944,34 @@ with tab0:
         else:
             _commit_overrides()
             try:
-                with st.spinner("Re-running full pipeline…"):
-                    # 1. Train predictor with new params
-                    fc_kwargs = profile_predictor_kwargs(_active)
-                    fc_kwargs["lat"] = new_lat if new_use_weather else None
-                    fc_kwargs["lon"] = new_lon if new_use_weather else None
-                    fc_kwargs["timezone"] = new_tz if new_use_weather else "auto"
-                    fc = DirectMultiStepForecaster(
-                        capacity_kwp=float(new_solar_kwp), **fc_kwargs,
+                # 1. Train predictor with new params (with progress bar)
+                fc_kwargs = profile_predictor_kwargs(_active)
+                fc_kwargs["lat"] = new_lat if new_use_weather else None
+                fc_kwargs["lon"] = new_lon if new_use_weather else None
+                fc_kwargs["timezone"] = new_tz if new_use_weather else "auto"
+                fc = DirectMultiStepForecaster(
+                    capacity_kwp=float(new_solar_kwp), **fc_kwargs,
+                )
+                import time
+                _prog = st.progress(0.0)
+                _msg  = st.empty()
+                _t0 = time.time()
+                def _on_h(i, n, h):
+                    _prog.progress(i / n)
+                    elapsed = time.time() - _t0
+                    eta = elapsed * (n - i) / max(i, 1)
+                    _msg.caption(
+                        f"Training horizon {i}/{n} (h={h}) · "
+                        f"{elapsed:.0f}s elapsed · ~{eta:.0f}s remaining"
                     )
-                    metrics = fc.fit(st.session_state.df, verbose=False)
-                    st.session_state.forecaster = fc
-                    # Persist freshly retrained model
-                    save_forecaster(st.session_state.site_profile_id, fc)
+                metrics = fc.fit(st.session_state.df, verbose=False,
+                                  progress_callback=_on_h)
+                _prog.progress(1.0)
+                _msg.caption(f"Train done in {time.time()-_t0:.1f}s · "
+                              f"now running Manager + Bill + PowerRECO…")
+                st.session_state.forecaster = fc
+                save_forecaster(st.session_state.site_profile_id, fc)
+                with st.spinner("Running Manager + Bill + PowerRECO…"):
                     fr = fc.forecast(output_steps=48)
                     st.session_state.forecast_result = fr
 
@@ -1232,31 +1247,48 @@ with tab2:
     with col_train:
         if st.button("Train Forecaster", type="primary", use_container_width=True):
             try:
-                with st.spinner("Training LightGBM models for all horizons…"):
-                    fc_kwargs = profile_predictor_kwargs(profile)
-                    # User-overridable values take precedence over profile defaults
-                    fc_kwargs.update({
-                        "n_estimators":  int(n_estimators),
-                        "learning_rate": lr,
-                    })
-                    # lat/lon + real-weather flag from Site Setup overrides
-                    if use_real_weather:
-                        fc_kwargs["lat"]      = float(lat)
-                        fc_kwargs["lon"]      = float(lon)
-                        fc_kwargs["timezone"] = _so("timezone", profile.timezone)
-                    else:
-                        fc_kwargs["lat"] = None
-                        fc_kwargs["lon"] = None
-                    fc = DirectMultiStepForecaster(
-                        capacity_kwp=capacity_kwp,
-                        **fc_kwargs,
+                fc_kwargs = profile_predictor_kwargs(profile)
+                fc_kwargs.update({
+                    "n_estimators":  int(n_estimators),
+                    "learning_rate": lr,
+                })
+                if use_real_weather:
+                    fc_kwargs["lat"]      = float(lat)
+                    fc_kwargs["lon"]      = float(lon)
+                    fc_kwargs["timezone"] = _so("timezone", profile.timezone)
+                else:
+                    fc_kwargs["lat"] = None
+                    fc_kwargs["lon"] = None
+                fc = DirectMultiStepForecaster(
+                    capacity_kwp=capacity_kwp,
+                    **fc_kwargs,
+                )
+
+                # Visible progress so the user knows training is alive.
+                # 24 horizons × 3 quantiles = 72 boosters + 24 baselines.
+                import time
+                _prog_bar = st.progress(0.0)
+                _prog_msg = st.empty()
+                _t0 = time.time()
+                def _on_horizon(i_done, n_total, h):
+                    pct = i_done / n_total
+                    elapsed = time.time() - _t0
+                    eta = elapsed * (n_total - i_done) / max(i_done, 1)
+                    _prog_bar.progress(pct)
+                    _prog_msg.caption(
+                        f"Training horizon {i_done}/{n_total} (h={h} = "
+                        f"{h*30} min ahead) · {elapsed:.0f}s elapsed · "
+                        f"~{eta:.0f}s remaining"
                     )
-                    metrics = fc.fit(df, verbose=False)
+                metrics = fc.fit(df, verbose=False, progress_callback=_on_horizon)
+                _prog_bar.progress(1.0)
+                _prog_msg.caption(f"Done in {time.time()-_t0:.1f}s")
+
                 st.session_state.forecaster = fc
-                # Persist so the model is ready next time the app opens
                 save_forecaster(st.session_state.site_profile_id, fc)
                 st.success(
-                    f"Trained {metrics['n_models_trained']} models. "
+                    f"Trained {metrics['n_models_trained']} models in "
+                    f"{time.time()-_t0:.1f}s. "
                     f"Mean MAPE: {metrics['mean_mape']:.2f}%  |  "
                     f"MAPE@24h: {metrics.get('mape_at_h24', 0):.2f}%  ·  "
                     f"Saved to `data/sites/{st.session_state.site_profile_id}/forecaster.joblib`"
