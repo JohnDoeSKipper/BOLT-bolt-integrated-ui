@@ -97,6 +97,11 @@ for key, default in [
     # (which is the user's manual-mode run on historical data).
     ("live_manager_results", None),
     ("live_manager_last_tick", -1),
+    # Live battery state-of-charge — carried across ticks so the Manager's
+    # next plan starts from the SOC reached after executing the previous
+    # tick's first-interval decision.  Without this the Manager re-plans
+    # from a fresh 50 % every tick, ignoring battery state evolution.
+    ("live_battery_soc_pct", None),
     # Per-site override dict: {site_id: {field: user_value}}.  Any field not
     # in here falls back to the site profile preset.  Editing in the Site
     # Setup tab populates these; switching site profile in the sidebar
@@ -284,6 +289,33 @@ def _run_manager_on_live_forecast() -> list | None:
     if mgr_df is None or mgr_df.empty:
         return None
 
+    # ── #1: PREPEND THE LATEST ACTUAL ─────────────────────────────────────
+    # Ground the Manager's first dispatch decision in reality.  Without
+    # this, even the "right now" decision is based on a prediction made
+    # 30 min ago.  We add the most-recently-revealed row from the
+    # forecaster's history (which advance_one_tick has been appending to)
+    # as the first interval of the Manager input.  Subsequent rows are
+    # the 24-h forecast as before.
+    if fc.history is not None and len(fc.history) > 0:
+        try:
+            last_row = fc.history.iloc[[-1]]
+            actual_row = pd.DataFrame({
+                "timestamp":   pd.to_datetime(last_row["timestamp"].values),
+                "kw_import":   last_row["kw_import"].astype(float).values,
+                "kw_export":   last_row.get("kw_export",   pd.Series([0.0])).astype(float).values,
+                "kvar_import": last_row.get("kvar_import", pd.Series([0.0])).astype(float).values,
+                "kvar_export": last_row.get("kvar_export", pd.Series([0.0])).astype(float).values,
+            })
+            actual_row["kw_net"]   = actual_row["kw_import"]   - actual_row["kw_export"]
+            actual_row["kvar_net"] = actual_row["kvar_import"] - actual_row["kvar_export"]
+            actual_row["kva"]      = np.sqrt(actual_row["kw_net"]**2 + actual_row["kvar_net"]**2)
+            # Skip if the actual's timestamp is already inside the forecast
+            # window (shouldn't happen, but defensive).
+            if actual_row["timestamp"].iloc[0] < mgr_df["timestamp"].iloc[0]:
+                mgr_df = pd.concat([actual_row, mgr_df], ignore_index=True)
+        except Exception:
+            pass    # fall back to forecast-only if shape mismatch
+
     # Build loads dict from profile, then layer Site Setup overrides on top
     loads = profile_loads_for_manager(profile)
     ov = _site_overrides_for(profile.id)
@@ -306,6 +338,17 @@ def _run_manager_on_live_forecast() -> list | None:
         if "hvac_max_cut_pct" in ov:
             hv["max_cut_pct"] = float(ov["hvac_max_cut_pct"]) / 100.0
 
+    # ── #2: SOC CONTINUITY ────────────────────────────────────────────────
+    # If a live battery SOC has been tracked across previous ticks, use
+    # IT as initial_soc_pct.  This makes the Manager's strategy actually
+    # COMPOUND — pre-charging on tick 5 affects available capacity at
+    # tick 30.  Without this, every tick re-plans from a fresh 50 % SOC.
+    live_soc = st.session_state.get("live_battery_soc_pct")
+    if live_soc is None:
+        init_soc = float(_so("init_soc_pct", profile.initial_soc_pct))
+    else:
+        init_soc = float(live_soc)
+
     try:
         return run_ai_manager(
             mgr_df, loads,
@@ -314,7 +357,7 @@ def _run_manager_on_live_forecast() -> list | None:
             peak_target_pct=float(_so("md_target_pct",      profile.md_target_pct)),
             bat_charge_upper_pct=float(_so("charge_upper_pct", profile.charge_upper_pct)),
             c_rate=float(_so("c_rate", profile.c_rate)),
-            initial_soc_pct=float(_so("init_soc_pct", profile.initial_soc_pct)),
+            initial_soc_pct=init_soc,
             bat_efficiency=0.95,
             peak_reference_kva=None,
         )
@@ -1403,6 +1446,10 @@ with tab_live:
 
     # ── Initialize the simulation lazily on first entry ─────────────────────
     if st.session_state.sim_state is None:
+        # Make sure live SOC + manager cache start fresh too
+        st.session_state.live_battery_soc_pct  = None
+        st.session_state.live_manager_results  = None
+        st.session_state.live_manager_last_tick = -1
         try:
             with st.spinner("Initialising live simulation: re-fitting forecaster on "
                              "just the 70% slice (honest train/eval — model genuinely "
@@ -1488,6 +1535,10 @@ with tab_live:
     if b6.button("🔄 Reset sim",    use_container_width=True, key="lsim_reset"):
         st.session_state.sim_state = None
         st.session_state.sim_playing = False
+        # Reset live SOC + Manager cache so the next sim starts fresh.
+        st.session_state.live_battery_soc_pct  = None
+        st.session_state.live_manager_results  = None
+        st.session_state.live_manager_last_tick = -1
         st.rerun()
 
     sp1, sp2 = st.columns([3, 2])
@@ -1533,9 +1584,22 @@ with tab_live:
         if sim.tick != st.session_state.get("live_manager_last_tick"):
             try:
                 _lm = _run_manager_on_live_forecast()
-                if _lm is not None:
+                if _lm is not None and len(_lm) > 0:
                     st.session_state.live_manager_results = _lm
                     st.session_state.live_manager_last_tick = sim.tick
+                    # ── #2 SOC CONTINUITY ──────────────────────────────────
+                    # Save the SOC AFTER the first interval (which is the
+                    # decision we're "executing" this tick) so the next
+                    # Manager run starts from the post-execution state.
+                    try:
+                        _first = _lm[0]
+                        # Manager outputs `battery_soc_pct` as 0–100 — convert
+                        # to fraction for initial_soc_pct
+                        st.session_state.live_battery_soc_pct = float(
+                            _first.get("battery_soc_pct", 50.0)
+                        ) / 100.0
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -2075,6 +2139,63 @@ with tab3:
                 "Lower the **MD target %** in Site Setup to make the strategy "
                 "more aggressive."
             )
+
+        # ── #3 FORECAST vs ACTUAL DIVERGENCE ─────────────────────────────
+        # When reality diverges from forecast, the previous tick's plan
+        # was wrong by exactly this amount.  Big spikes here = moments
+        # where the model missed and the Manager would have under-/over-
+        # reacted.  Helps the user reason about WHEN the live strategy
+        # was off.
+        sim_d = st.session_state.get("sim_state")
+        if sim_d is not None and len(sim_d.forecast_log) > 0:
+            verified = pd.DataFrame([
+                r for r in sim_d.forecast_log
+                if r.get("actual") is not None and r.get("horizon_steps") == 1
+            ])
+            if len(verified) > 0:
+                st.markdown("##### 📉 Forecast vs Actual Divergence")
+                st.caption(
+                    "For every revealed actual, this is (actual − forecast that "
+                    "was made 30 min earlier).  Positive bars = the model "
+                    "underpredicted (under-reacted); negative = overpredicted "
+                    "(over-reacted).  The flatter the line, the more closely "
+                    "the Manager's plan tracked reality."
+                )
+                verified = verified.sort_values("target_ts").reset_index(drop=True)
+                verified["divergence_kw"] = verified["actual"] - verified["median"]
+                verified["abs_pct"] = (
+                    verified["divergence_kw"].abs()
+                    / verified["actual"].clip(lower=1.0) * 100
+                )
+                # KPIs
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("Verified rows",        f"{len(verified):,}")
+                d2.metric("Mean |error|",         f"{verified['divergence_kw'].abs().mean():.1f} kW")
+                d3.metric("Max underpredict",     f"+{verified['divergence_kw'].max():.0f} kW")
+                d4.metric("Max overpredict",      f"{verified['divergence_kw'].min():.0f} kW")
+
+                # Coloured signed-error bars
+                colors = ["#ef4444" if v > 0 else "#3b82f6" for v in verified["divergence_kw"]]
+                fig_dv = go.Figure()
+                fig_dv.add_trace(go.Bar(
+                    x=verified["target_ts"], y=verified["divergence_kw"],
+                    marker_color=colors,
+                    name="actual − forecast",
+                    hovertemplate="%{x}<br>Δ %{y:.1f} kW<extra></extra>",
+                ))
+                # Reference line at 0
+                fig_dv.add_trace(go.Scatter(
+                    x=[verified["target_ts"].min(), verified["target_ts"].max()],
+                    y=[0, 0], mode="lines",
+                    line=dict(color="#9ca3af", width=1), showlegend=False,
+                ))
+                fig_dv.update_layout(
+                    xaxis_title="Time", yaxis_title="kW (actual − h=1 forecast)",
+                    height=320, showlegend=False,
+                    bargap=0.05,
+                )
+                st.plotly_chart(fig_dv, use_container_width=True,
+                                 key=f"mgr_dv_{len(verified)}_{st.session_state.live_manager_last_tick}")
 
     _live_manager_view()
 
