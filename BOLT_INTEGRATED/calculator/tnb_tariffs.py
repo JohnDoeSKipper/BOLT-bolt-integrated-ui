@@ -347,15 +347,39 @@ def auto_detect_tariff(df: pd.DataFrame, interval_minutes: int = 30) -> tuple[Ta
         "biz_ratio":       round(biz_ratio, 2),
     }
 
-    if abs_peak_kw >= 5000:
-        code = "E2" if abs_peak_kw >= 1500 and load_factor > 0.6 else "E1"
-        why  = (f"Peak demand {abs_peak_kw:,.0f} kW ≥ 5,000 kW → Extra High Voltage supply. "
-                f"Load factor {load_factor:.0%}.")
+    if abs_peak_kw >= 1000:
+        # High-Voltage supply (33 kV / 132 kV). D, E1, E2 all live here.
+        # TNB mandates TOU (E1/E2) once MD ≥ 1,500 kW; below that threshold
+        # D vs E1 is the customer's elected metering choice.  We infer it from
+        # the load profile: significant off-peak usage (≥ 30 % overnight or
+        # load factor ≥ 0.65) signals a 24/7 operation that benefits from TOU.
+        night_mask_hv = (df["hour"] < 8) | (df["hour"] >= 22)
+        night_avg_hv  = float(df.loc[night_mask_hv, "kw_import"].mean()) if night_mask_hv.any() else 0.0
+        night_frac_hv = night_avg_hv / avg_kw if avg_kw > 0 else 0.0
+        tou_profile   = night_frac_hv >= 0.30 or load_factor >= 0.65
 
-    elif abs_peak_kw >= 1000:
-        code = "D"
-        why  = (f"Peak demand {abs_peak_kw:,.0f} kW falls in 1,000–4,999 kW range → "
-                f"High Voltage (33 kV / 132 kV) supply, Tariff D.")
+        if abs_peak_kw >= 1500 and tou_profile:
+            code = "E2"
+            why  = (f"Peak demand {abs_peak_kw:,.0f} kW ≥ 1,500 kW with strong off-peak usage "
+                    f"({night_frac_hv:.0%} overnight, LF {load_factor:.0%}) → "
+                    f"mandatory TOU, Tariff E2.")
+        elif abs_peak_kw >= 1500:
+            # MD ≥ 1,500 kW but daytime-heavy — technically E2 mandatory;
+            # flag D as a likely-wrong election and nudge E2.
+            code = "E2"
+            why  = (f"Peak demand {abs_peak_kw:,.0f} kW ≥ 1,500 kW → Tariff E2 mandatory "
+                    f"by TNB regulation regardless of load shape. "
+                    f"(Daytime-heavy profile; load factor {load_factor:.0%}.)")
+        elif tou_profile:
+            code = "E1"
+            why  = (f"Peak demand {abs_peak_kw:,.0f} kW → High Voltage supply. "
+                    f"Significant off-peak usage ({night_frac_hv:.0%} overnight, "
+                    f"LF {load_factor:.0%}) indicates TOU election → Tariff E1.")
+        else:
+            code = "D"
+            why  = (f"Peak demand {abs_peak_kw:,.0f} kW → High Voltage supply. "
+                    f"Daytime-heavy profile (off-peak {night_frac_hv:.0%}, "
+                    f"LF {load_factor:.0%}) → Tariff D (non-TOU).")
 
     elif abs_peak_kw >= 25:
         night_mask = (df["hour"] < 8) | (df["hour"] >= 22)
